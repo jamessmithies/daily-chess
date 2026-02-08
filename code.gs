@@ -1,15 +1,9 @@
 // ============================================================
 // EMAIL CHESS
 // ============================================================
-// Play asynchronous correspondence chess against Claude via email.
+// Play correspondence chess against Claude via email.
 // The script polls Gmail for your moves and responds with Claude's
 // moves in the same thread. Fully email-driven after the first game.
-//
-// Security Features:
-//   - Enhanced input validation and sanitization
-//   - Comprehensive audit logging
-//   - Rate limiting and abuse prevention
-//   - Secure error handling
 //
 // Commands (must be the first word in your reply):
 //   NEW       — start a new game
@@ -39,16 +33,26 @@ const SECURITY_CONFIG = {
   ENABLE_AUDIT_LOGGING: true,
   ENABLE_STRICT_VALIDATION: true,
 
-  // Rate limiting (more granular)
+  // Rate limiting
   MAX_MOVES_PER_HOUR: 20,
   MAX_COMMANDS_PER_DAY: 50,
-  MAX_FAILED_ATTEMPTS: 5,
+  MAX_FAILED_ATTEMPTS_PER_HOUR: 5,
   LOCKOUT_DURATION_MS: 3600000, // 1 hour
 
-  // Input constraints (stricter)
+  // Input constraints
   MAX_INPUT_LENGTH: 100,
-  ALLOWED_MOVE_PATTERN: /^[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?$/,
+
+  // A permissive-but-structured SAN-ish pattern (first token only)
+  // Supports: O-O/O-O-O, piece moves with optional disambiguation, captures,
+  // pawn moves/captures, promotions, and optional +/# at end.
+  // NOTE: legality is still enforced by Claude; this is format gating.
+  SAN_PATTERN: /^(O-O-O|O-O|[KQRBN](?:[a-h]|[1-8])?x?[a-h][1-8](?:=[QRBN])?|[a-h]x?[a-h][1-8](?:=[QRBN])?|[a-h][1-8](?:=[QRBN])?)([+#])?$/,
+
   ALLOWED_COMMANDS: ['NEW', 'RESIGN', 'PAUSE', 'CONTINUE'],
+
+  // Audit retention (prevents Script Properties bloat)
+  AUDIT_MAX_ENTRIES: 80,
+  AUDIT_MAX_AGE_DAYS: 14,
 };
 
 // --- CONFIGURATION ---
@@ -97,61 +101,137 @@ If two pieces can reach the same square, add the file or rank:
 
 // --- SECURITY HELPERS ---
 
-/**
- * Audit logging for security events
- */
-function auditLog(event, details, severity = 'INFO') {
-  if (!SECURITY_CONFIG.ENABLE_AUDIT_LOGGING) return;
+function nowIso_() {
+  return new Date().toISOString();
+}
 
-  const log = {
-    timestamp: new Date().toISOString(),
-    event: event,
-    severity: severity,
-    details: details,
-    user: Session.getEffectiveUser().getEmail(),
-  };
+function todayKey_() {
+  // YYYY-MM-DD in script TZ
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
 
-  console.log(JSON.stringify(log));
+function hourKey_() {
+  // YYYY-MM-DD-HH in script TZ
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd-HH');
+}
 
-  // Store critical events
-  if (severity === 'CRITICAL' || severity === 'ERROR') {
-    const props = PropertiesService.getScriptProperties();
-    const auditKey = 'AUDIT_' + Date.now();
-    props.setProperty(auditKey, JSON.stringify(log));
+function redact_(value) {
+  const s = String(value ?? '');
+  if (s.length <= 4) return '****';
+  return '****' + s.slice(-4);
+}
+
+function pruneAudit_() {
+  const props = PropertiesService.getScriptProperties();
+  const keys = props.getKeys();
+
+  const auditKeys = [];
+  for (const k of keys) {
+    if (k.startsWith('AUDIT_')) auditKeys.push(k);
+  }
+  if (auditKeys.length === 0) return;
+
+  // Parse timestamps from keys (AUDIT_<millis>)
+  auditKeys.sort((a, b) => {
+    const ta = parseInt(a.slice('AUDIT_'.length), 10) || 0;
+    const tb = parseInt(b.slice('AUDIT_'.length), 10) || 0;
+    return tb - ta; // newest first
+  });
+
+  // Age-based pruning
+  const maxAgeMs = SECURITY_CONFIG.AUDIT_MAX_AGE_DAYS * 24 * 3600 * 1000;
+  const now = Date.now();
+  for (const k of auditKeys) {
+    const t = parseInt(k.slice('AUDIT_'.length), 10) || 0;
+    if (t && now - t > maxAgeMs) props.deleteProperty(k);
+  }
+
+  // Count-based pruning (keep newest N)
+  const remaining = auditKeys
+    .filter(k => props.getProperty(k) != null)
+    .sort((a, b) => (parseInt(b.slice(6), 10) || 0) - (parseInt(a.slice(6), 10) || 0));
+
+  if (remaining.length > SECURITY_CONFIG.AUDIT_MAX_ENTRIES) {
+    for (let i = SECURITY_CONFIG.AUDIT_MAX_ENTRIES; i < remaining.length; i++) {
+      props.deleteProperty(remaining[i]);
+    }
   }
 }
 
 /**
- * Check for rate limit violations
+ * Audit logging for security events
+ * - Logs to execution log via console.log
+ * - Persists only ERROR/CRITICAL to Script Properties (bounded by retention)
+ * - Avoids persisting sensitive details (token, API key)
+ */
+function auditLog(event, details, severity = 'INFO') {
+  if (!SECURITY_CONFIG.ENABLE_AUDIT_LOGGING) return;
+
+  const safeDetails = details || {};
+  const log = {
+    timestamp: nowIso_(),
+    event,
+    severity,
+    details: safeDetails,
+  };
+
+  console.log(JSON.stringify(log));
+
+  if (severity === 'CRITICAL' || severity === 'ERROR') {
+    const props = PropertiesService.getScriptProperties();
+    const auditKey = 'AUDIT_' + Date.now();
+    props.setProperty(auditKey, JSON.stringify(log));
+    pruneAudit_();
+  }
+}
+
+/**
+ * Check for rate limit violations (fixed windows):
+ * - MOVE: per-hour counter
+ * - FAILED: per-hour counter
+ * - COMMAND: per-day counter
+ * Lockout applies per identifier.
  */
 function checkRateLimit(type, identifier) {
   const props = PropertiesService.getScriptProperties();
   const now = Date.now();
-  const window = 3600000; // 1 hour window
 
   // Check lockout
   const lockoutKey = `LOCKOUT_${identifier}`;
   const lockoutUntil = parseInt(props.getProperty(lockoutKey) || '0', 10);
   if (lockoutUntil > now) {
     auditLog('RATE_LIMIT_LOCKOUT', { type, identifier }, 'WARNING');
-    throw new Error('Account temporarily locked due to suspicious activity');
+    throw new Error('Account temporarily locked due to suspicious activity. Please try again later.');
   }
 
-  // Track attempts
-  const attemptKey = `ATTEMPTS_${type}_${identifier}_${Math.floor(now / window)}`;
+  // Bucket keys by window
+  let bucket;
+  let limit;
+
+  switch (type) {
+    case 'MOVE':
+      bucket = hourKey_();
+      limit = SECURITY_CONFIG.MAX_MOVES_PER_HOUR;
+      break;
+    case 'FAILED':
+      bucket = hourKey_();
+      limit = SECURITY_CONFIG.MAX_FAILED_ATTEMPTS_PER_HOUR;
+      break;
+    case 'COMMAND':
+      bucket = todayKey_();
+      limit = SECURITY_CONFIG.MAX_COMMANDS_PER_DAY;
+      break;
+    default:
+      bucket = hourKey_();
+      limit = 10;
+      break;
+  }
+
+  const attemptKey = `ATTEMPTS_${type}_${identifier}_${bucket}`;
   const attempts = parseInt(props.getProperty(attemptKey) || '0', 10) + 1;
   props.setProperty(attemptKey, String(attempts));
 
-  let limit;
-  switch (type) {
-    case 'MOVE': limit = SECURITY_CONFIG.MAX_MOVES_PER_HOUR; break;
-    case 'COMMAND': limit = SECURITY_CONFIG.MAX_COMMANDS_PER_DAY; break;
-    case 'FAILED': limit = SECURITY_CONFIG.MAX_FAILED_ATTEMPTS; break;
-    default: limit = 10;
-  }
-
   if (attempts > limit) {
-    // Apply lockout
     props.setProperty(lockoutKey, String(now + SECURITY_CONFIG.LOCKOUT_DURATION_MS));
     auditLog('RATE_LIMIT_EXCEEDED', { type, identifier, attempts, limit }, 'CRITICAL');
     throw new Error('Rate limit exceeded. Please try again later.');
@@ -161,59 +241,37 @@ function checkRateLimit(type, identifier) {
 }
 
 /**
- * Sanitize input more aggressively
+ * Sanitize input (for email/user-visible fields).
+ * NOTE: Do not over-sanitize structured fields (like FEN) beyond trimming/length,
+ * because it can silently change meaning. Use format validators instead.
  */
 function sanitizeInput(input, maxLength = SECURITY_CONFIG.MAX_INPUT_LENGTH) {
   if (typeof input !== 'string') return '';
-
-  // Remove all control characters and non-printable characters
-  let sanitized = input.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
-
-  // Remove potential script injection patterns
+  let sanitized = input.replace(/[\x00-\x1F\x7F-\x9F]/g, ''); // control chars
+  // Strip HTML-ish tags (mostly to keep logs/emails clean)
   sanitized = sanitized.replace(/<[^>]*>/g, '');
-  sanitized = sanitized.replace(/javascript:/gi, '');
-  sanitized = sanitized.replace(/on\w+\s*=/gi, '');
-
-  // Limit length
-  if (sanitized.length > maxLength) {
-    sanitized = sanitized.substring(0, maxLength);
-  }
-
+  if (sanitized.length > maxLength) sanitized = sanitized.substring(0, maxLength);
   return sanitized.trim();
 }
 
 /**
- * Validate chess move with strict pattern matching
+ * Validate chess move format (SAN-ish).
+ * We only accept "first token only" moves, and then Claude validates legality.
  */
 function validateMovePattern(move) {
   if (!SECURITY_CONFIG.ENABLE_STRICT_VALIDATION) return true;
-
-  // Strict pattern for algebraic notation
-  const validPatterns = [
-    /^[a-h][1-8]$/, // Pawn move
-    /^[a-h]x[a-h][1-8]$/, // Pawn capture
-    /^[KQRBN][a-h][1-8]$/, // Piece move
-    /^[KQRBN]x[a-h][1-8]$/, // Piece capture
-    /^[KQRBN][a-h]x?[a-h][1-8]$/, // Piece move with file disambiguation
-    /^[KQRBN][1-8]x?[a-h][1-8]$/, // Piece move with rank disambiguation
-    /^O-O$/, // Kingside castle
-    /^O-O-O$/, // Queenside castle
-    /^[a-h][18]=[QRBN]$/, // Pawn promotion
-    /^[a-h]x[a-h][18]=[QRBN]$/, // Pawn capture with promotion
-  ];
-
-  // Remove check/checkmate indicators for validation
-  const cleanMove = move.replace(/[+#]$/, '');
-
-  return validPatterns.some(pattern => pattern.test(cleanMove));
+  const m = String(move || '').trim();
+  if (!m) return false;
+  if (m.length > CONFIG.MAX_MOVE_LEN) return false;
+  return SECURITY_CONFIG.SAN_PATTERN.test(m);
 }
 
 // --- UTIL HELPERS ---
 function getAccountEmail() {
   const e = (Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
   if (!e) {
-    auditLog('EMAIL_ERROR', 'Could not determine account email', 'ERROR');
-    throw new Error('Configuration error. Please contact administrator.');
+    auditLog('EMAIL_ERROR', { msg: 'Could not determine account email' }, 'ERROR');
+    throw new Error('Configuration error. Could not determine account email.');
   }
   return e;
 }
@@ -221,8 +279,8 @@ function getAccountEmail() {
 function getDestinationEmail() {
   const e = (CONFIG.EMAIL || Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
   if (!e) {
-    auditLog('EMAIL_ERROR', 'Destination email not set', 'ERROR');
-    throw new Error('Configuration error. Please contact administrator.');
+    auditLog('EMAIL_ERROR', { msg: 'Destination email not set' }, 'ERROR');
+    throw new Error('Configuration error. Destination email not set.');
   }
   return e;
 }
@@ -234,22 +292,20 @@ function normalizeEmail(fromField) {
 }
 
 /**
- * Enhanced sender verification with multiple security checks
- * - Header-based allowlist
- * - Gmail query verification for "from:me" messages
- * - Audit logging for security events
+ * Enhanced sender verification:
+ * - Header-based allowlist (must match effective user email)
+ * - Thread verification: ensure thread has at least one from:me message around that date
+ *   (lightweight extra check; not cryptographic)
  */
 function onlyMeGuard(message, thread) {
   const allowed = getAccountEmail();
   const sender = normalizeEmail(message.getFrom());
 
-  // Check 1: Basic sender match
   if (sender !== allowed) {
     auditLog('SENDER_MISMATCH', { sender, allowed }, 'WARNING');
     return false;
   }
 
-  // Check 2: Verify thread contains from:me messages
   try {
     if (thread && thread.getId) {
       const id = thread.getId();
@@ -267,7 +323,7 @@ function onlyMeGuard(message, thread) {
       }
     }
   } catch (e) {
-    auditLog('THREAD_VERIFICATION_ERROR', { error: e.toString() }, 'ERROR');
+    auditLog('THREAD_VERIFICATION_ERROR', { error: String(e) }, 'ERROR');
     if (thread) return false;
   }
 
@@ -279,10 +335,9 @@ function withScriptLock(fn) {
   try {
     lock.waitLock(15000);
   } catch (e) {
-    auditLog('LOCK_TIMEOUT', { error: e.toString() }, 'ERROR');
+    auditLog('LOCK_TIMEOUT', { error: String(e) }, 'ERROR');
     throw new Error('System busy. Please try again.');
   }
-
   try {
     return fn();
   } finally {
@@ -295,22 +350,25 @@ function enforceRateLimit(propertyKey, minMs) {
   const now = Date.now();
   const last = parseInt(props.getProperty(propertyKey) || '0', 10);
   if (last && now - last < minMs) {
-    auditLog('API_RATE_LIMITED', { propertyKey, waitTime: minMs - (now - last) }, 'WARNING');
-    throw new Error('Please wait before trying again.');
+    auditLog('API_RATE_LIMITED', { propertyKey, waitMs: minMs - (now - last) }, 'WARNING');
+    throw new Error('Please wait briefly before trying again.');
   }
   props.setProperty(propertyKey, String(now));
 }
 
+/**
+ * Game token:
+ * - Use URL-safe token for Gmail subjects/search.
+ * - Do NOT log token.
+ */
 function getOrCreateGameToken() {
   const props = PropertiesService.getScriptProperties();
   let token = props.getProperty('CHESS_GAME_TOKEN');
   if (!token) {
-    // Use cryptographically secure random token
-    const bytes = Utilities.newBlob(Utilities.getUuid()).getBytes();
-    const hash = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes);
-    token = Utilities.base64Encode(hash).substring(0, 16);
+    // Use UUID (sufficient) and make it compact + URL-safe
+    token = Utilities.getUuid().replace(/-/g, '').slice(0, 20);
     props.setProperty('CHESS_GAME_TOKEN', token);
-    auditLog('GAME_TOKEN_CREATED', { token }, 'INFO');
+    auditLog('GAME_TOKEN_CREATED', { token: redact_(token) }, 'INFO');
   }
   return token;
 }
@@ -321,21 +379,15 @@ function buildSubject(prefix) {
 }
 
 function safeTrim(s, maxLen) {
-  s = sanitizeInput(String(s ?? ''), maxLen + 100); // Sanitize first with buffer
-  if (s.length > maxLen) return s.slice(0, maxLen);
-  return s;
+  const str = String(s ?? '');
+  if (str.length > maxLen) return str.slice(0, maxLen);
+  return str;
 }
 
 function isValidFen(fen) {
   if (typeof fen !== 'string') return false;
   fen = fen.trim();
   if (!fen || fen.length > CONFIG.MAX_FEN_LEN) return false;
-
-  // Check for injection attempts
-  if (fen.includes('<') || fen.includes('>') || fen.includes('javascript:')) {
-    auditLog('FEN_INJECTION_ATTEMPT', { fen }, 'CRITICAL');
-    return false;
-  }
 
   const parts = fen.split(/\s+/);
   if (parts.length < 4) return false;
@@ -366,13 +418,11 @@ function isValidFen(fen) {
         count += 1;
         if (ch === 'K') whiteKings++;
         if (ch === 'k') blackKings++;
-      }
-      else return false;
+      } else return false;
     }
     if (count !== 8) return false;
   }
 
-  // Each side must have exactly one king
   if (whiteKings !== 1 || blackKings !== 1) {
     auditLog('INVALID_FEN_KINGS', { whiteKings, blackKings }, 'WARNING');
     return false;
@@ -382,11 +432,6 @@ function isValidFen(fen) {
 }
 
 // --- API BUDGET HELPERS ---
-function todayKey_() {
-  // YYYY-MM-DD in script TZ
-  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-}
-
 function bumpClaudeDailyCount_() {
   const props = PropertiesService.getScriptProperties();
   const key = 'CHESS_CLAUDE_COUNT_' + todayKey_();
@@ -422,9 +467,8 @@ function getGameState() {
 function saveGameState(state) {
   const sheet = getSheet();
 
-  // Validate state before saving
   if (!isValidFen(state.fen)) {
-    auditLog('INVALID_STATE_SAVE_ATTEMPT', { fen: state.fen }, 'ERROR');
+    auditLog('INVALID_STATE_SAVE_ATTEMPT', { fen: String(state.fen).slice(0, 80) }, 'ERROR');
     throw new Error('Invalid game state');
   }
 
@@ -487,10 +531,9 @@ function validateApiKey() {
     throw new Error('API key not configured. Please check settings.');
   }
 
-  // Validate key format (basic check)
-  if (!/^sk-ant-/.test(key)) {
-    auditLog('API_KEY_INVALID_FORMAT', {}, 'ERROR');
-    throw new Error('API key format invalid.');
+  // NOTE: Key formats can change; keep only a very light check.
+  if (String(key).length < 20) {
+    auditLog('API_KEY_SUSPICIOUS', {}, 'WARNING');
   }
 
   const url = 'https://api.anthropic.com/v1/messages';
@@ -554,8 +597,9 @@ function callClaude(systemPrompt, userMessage, maxTokens) {
   bumpClaudeDailyCount_();
   enforceRateLimit('CHESS_LAST_CLAUDE_CALL_MS', CONFIG.MIN_CLAUDE_CALL_MS);
 
-  // Sanitize inputs to prevent prompt injection
-  userMessage = sanitizeInput(userMessage, 5000);
+  // IMPORTANT: Don't "sanitize away meaning" from structured prompts.
+  // We do only a conservative trim/limit.
+  userMessage = safeTrim(String(userMessage ?? ''), 5000);
 
   const url = 'https://api.anthropic.com/v1/messages';
   const payload = {
@@ -563,7 +607,7 @@ function callClaude(systemPrompt, userMessage, maxTokens) {
     max_tokens: maxTokens,
     system: systemPrompt,
     messages: [{ role: 'user', content: userMessage }],
-    temperature: 0.3, // Lower temperature for more consistent responses
+    temperature: 0.3,
   };
 
   const options = {
@@ -585,7 +629,7 @@ function callClaude(systemPrompt, userMessage, maxTokens) {
   try {
     json = JSON.parse(text);
   } catch (e) {
-    auditLog('CLAUDE_PARSE_ERROR', { code, error: e.toString() }, 'ERROR');
+    auditLog('CLAUDE_PARSE_ERROR', { code, error: String(e) }, 'ERROR');
     throw new Error('API communication error.');
   }
 
@@ -657,19 +701,17 @@ function generateTextBoard(fen) {
 
 // --- CORE GAME LOGIC ---
 function parseClaudeJson(responseText) {
-  // Remove any potential markdown or extra text
+  // STRICT: only allow raw JSON (optionally wrapped in ```json fences)
   const cleaned = String(responseText || '')
-    .replace(/```json\n?/g, '')
-    .replace(/```\n?/g, '')
-    .replace(/^[^{]*/, '')  // Remove everything before first {
-    .replace(/[^}]*$/, '')  // Remove everything after last }
+    .replace(/```json\s*/gi, '')
+    .replace(/```\s*/g, '')
     .trim();
 
   let parsed;
   try {
     parsed = JSON.parse(cleaned);
   } catch (e) {
-    auditLog('CLAUDE_JSON_PARSE_FAILED', { response: responseText }, 'ERROR');
+    auditLog('CLAUDE_JSON_PARSE_FAILED', { sample: safeTrim(cleaned, 200) }, 'ERROR');
     throw new Error('Invalid response format');
   }
 
@@ -678,7 +720,6 @@ function parseClaudeJson(responseText) {
     throw new Error('Invalid response structure');
   }
 
-  // Strict validation
   const move = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
   const fen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
   const comment = safeTrim(parsed.comment, CONFIG.MAX_COMMENT_LEN);
@@ -691,7 +732,7 @@ function parseClaudeJson(responseText) {
   }
 
   if (!fen || !isValidFen(fen)) {
-    auditLog('CLAUDE_INVALID_FEN', { fen }, 'ERROR');
+    auditLog('CLAUDE_INVALID_FEN', { fen: safeTrim(fen, 80) }, 'ERROR');
     throw new Error('Invalid position received');
   }
 
@@ -712,7 +753,7 @@ function getClaudeMove() {
   try {
     parsed = parseClaudeJson(responseText);
   } catch (e) {
-    Logger.log('Failed to parse Claude response: ' + e.toString());
+    Logger.log('Failed to parse Claude response: ' + String(e));
     throw new Error('Unable to process move. Please try again.');
   }
 
@@ -737,27 +778,29 @@ function processPlayerMove(moveStr) {
   const state = getGameState();
   const email = getAccountEmail();
 
-  if (!state.gameActive) {
-    return { error: 'No active game. Reply NEW to start one.' };
-  }
+  if (!state.gameActive) return { error: 'No active game. Reply NEW to start one.' };
 
   moveStr = sanitizeInput(String(moveStr || '').trim(), CONFIG.MAX_MOVE_LEN);
-  if (!moveStr) {
-    return { error: 'Empty move. Reply with a move like Nf3 or e4.' };
-  }
+  if (!moveStr) return { error: 'Empty move. Reply with a move like Nf3 or e4.' };
 
-  // Rate limit check
+  // Rate limit: MOVE
   try {
     checkRateLimit('MOVE', email);
   } catch (e) {
-    return { error: e.toString() };
+    auditLog('RATE_LIMIT_MOVE', { error: String(e) }, 'WARNING');
+    return { error: String(e.message || e) };
   }
 
-  // Validate move pattern
+  // Format gate
   if (!validateMovePattern(moveStr)) {
-    checkRateLimit('FAILED', email);
+    try {
+      checkRateLimit('FAILED', email);
+    } catch (e) {
+      auditLog('RATE_LIMIT_FAILED', { error: String(e) }, 'WARNING');
+      return { error: String(e.message || e) };
+    }
     auditLog('INVALID_MOVE_PATTERN', { move: moveStr }, 'WARNING');
-    return { error: 'Invalid move format. Use standard algebraic notation.' };
+    return { error: 'Invalid move format. Use standard algebraic notation (e.g., Nf3, exd5, O-O, e8=Q).' };
   }
 
   const systemPrompt = `You are a chess position manager. The player is playing ${state.playerColour}.
@@ -768,6 +811,7 @@ TASK: Validate the player's move and return the updated position.
 
 Respond ONLY with the JSON object, no markdown fencing.`;
 
+  // Minimize injection surface: only FEN + move token
   const userMessage = `Current FEN: ${state.fen}\nPlayer's move: ${moveStr}`;
 
   const responseText = callClaude(systemPrompt, userMessage, CONFIG.MAX_TOKENS_VALIDATE_MOVE);
@@ -775,24 +819,28 @@ Respond ONLY with the JSON object, no markdown fencing.`;
   let parsed;
   try {
     const cleaned = String(responseText || '')
-      .replace(/```json\n?/g, '')
-      .replace(/```\n?/g, '')
-      .replace(/^[^{]*/, '')
-      .replace(/[^}]*$/, '')
+      .replace(/```json\s*/gi, '')
+      .replace(/```\s*/g, '')
       .trim();
     parsed = JSON.parse(cleaned);
   } catch (e) {
-    auditLog('MOVE_VALIDATION_PARSE_ERROR', { error: e.toString() }, 'ERROR');
+    auditLog('MOVE_VALIDATION_PARSE_ERROR', { error: String(e) }, 'ERROR');
     return { error: 'Failed to process move. Try again.' };
   }
 
   if (!parsed || typeof parsed !== 'object' || typeof parsed.valid !== 'boolean') {
+    auditLog('MOVE_VALIDATION_BAD_SHAPE', {}, 'ERROR');
     return { error: 'Failed to process move. Try again.' };
   }
 
   if (!parsed.valid) {
-    checkRateLimit('FAILED', email);
-    auditLog('ILLEGAL_MOVE', { move: moveStr, reason: parsed.reason }, 'WARNING');
+    try {
+      checkRateLimit('FAILED', email);
+    } catch (e) {
+      auditLog('RATE_LIMIT_FAILED', { error: String(e) }, 'WARNING');
+      return { error: String(e.message || e) };
+    }
+    auditLog('ILLEGAL_MOVE', { move: moveStr, reason: safeTrim(parsed.reason, 120) }, 'WARNING');
     return { error: 'Illegal move: ' + safeTrim(parsed.reason, 200) };
   }
 
@@ -800,10 +848,12 @@ Respond ONLY with the JSON object, no markdown fencing.`;
   const stdMove = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
 
   if (!isValidFen(nextFen)) {
+    auditLog('MOVE_VALIDATION_INVALID_FEN', { fen: safeTrim(nextFen, 80) }, 'ERROR');
     return { error: 'Move processing error. Try again.' };
   }
 
   if (!stdMove || !validateMovePattern(stdMove)) {
+    auditLog('MOVE_VALIDATION_INVALID_MOVE', { move: stdMove }, 'ERROR');
     return { error: 'Move processing error. Try again.' };
   }
 
@@ -888,7 +938,6 @@ function buildMoveEmail(claudeResponse) {
   }
 
   body += NOTATION_GUIDE;
-
   return safeTrim(body, 20000);
 }
 
@@ -911,27 +960,31 @@ function extractMoveFromReply(messageBody) {
   if (!freshText) return null;
 
   // Skip automated emails sent by the script itself
-  if (freshText.startsWith('Claude plays:')) return null;
-  if (freshText.startsWith('Your move:')) return null;
-  if (freshText.startsWith('New game!')) return null;
-  if (freshText.startsWith('You resigned.')) return null;
-  if (freshText.startsWith('Game paused.')) return null;
-  if (freshText.startsWith('Game resumed!')) return null;
-  if (freshText.startsWith('It\'s your move!')) return null;
-  if (freshText.startsWith('No active game.')) return null;
-  if (freshText.startsWith('Illegal move:')) return null;
+  const skipPrefixes = [
+    'Claude plays:',
+    'Your move:',
+    'New game!',
+    'You resigned.',
+    'Game paused.',
+    'Game resumed!',
+    "It's your move!",
+    'No active game.',
+    'Illegal move:',
+  ];
+  for (const p of skipPrefixes) {
+    if (freshText.startsWith(p)) return null;
+  }
 
-  // Commands must be the FIRST token
   const firstTokenRaw = freshText.split(/\s+/)[0];
   const firstToken = firstTokenRaw.toUpperCase();
-  if (firstToken === 'NEW') return { command: 'new' };
-  if (firstToken === 'RESIGN') return { command: 'resign' };
-  if (firstToken === 'PAUSE') return { command: 'pause' };
-  if (firstToken === 'CONTINUE') return { command: 'continue' };
 
-  // Security hardening: moves must be the FIRST token only (no regex searching the full text)
-  const moveExact = /^(O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)$/i;
-  if (moveExact.test(firstTokenRaw)) return { move: firstTokenRaw };
+  if (SECURITY_CONFIG.ALLOWED_COMMANDS.includes(firstToken)) {
+    return { command: firstToken.toLowerCase() };
+  }
+
+  if (validateMovePattern(firstTokenRaw)) {
+    return { move: firstTokenRaw };
+  }
 
   return null;
 }
@@ -960,10 +1013,19 @@ function checkForReplies() {
       const parsed = extractMoveFromReply(msg.getPlainBody());
       if (!parsed) continue;
 
-      // Mark as processed early to avoid re-processing on retries,
-      // but do NOT archive until after successful handling.
+      // Mark as processed early to avoid re-processing on retries
       state.lastProcessedCount = i + 1;
       saveGameState(state);
+
+      // Commands are "cheap" but still rate-limited per day
+      if (parsed.command) {
+        try {
+          checkRateLimit('COMMAND', getAccountEmail());
+        } catch (e) {
+          sendGameEmail('♟ Chess', String(e.message || e));
+          return;
+        }
+      }
 
       if (parsed.command === 'new') {
         startNewGameInternal_();
@@ -976,11 +1038,9 @@ function checkForReplies() {
         sendGameEmail(
           '♟ Chess',
           'You resigned. Good game!\n\n' +
-            'Move history: ' +
-            state.moveHistory +
+            'Move history: ' + state.moveHistory +
             '\n\nReply NEW to start a new game.'
         );
-        // Archive only after successful send
         if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         return;
       }
@@ -999,8 +1059,7 @@ function checkForReplies() {
         sendGameEmail(
           '♟ Chess',
           'Game resumed!\n\n' +
-            'Move history: ' +
-            state.moveHistory +
+            'Move history: ' + state.moveHistory +
             '\n\nReply with your move.'
         );
         if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
@@ -1023,19 +1082,15 @@ function checkForReplies() {
               '\n\nMove history: ' + cur.moveHistory +
               '\n\nTry again — reply with a valid move (as the first word).'
           );
-          // Do not archive on errors; keep visible
-          return;
+          return; // keep visible on errors
         }
 
-        // Delay between validation and response calls to avoid rate limiting
         Utilities.sleep(CONFIG.INTER_CALL_DELAY_MS);
 
         const claudeResult = getClaudeMove();
         if (claudeResult) {
           const emailBody = 'Your move: ' + result.move + '\n\n' + buildMoveEmail(claudeResult);
           sendGameEmail('♟ Chess', emailBody);
-
-          // Archive only after we successfully sent our response
           if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         }
         return;
@@ -1089,8 +1144,6 @@ function startNewGameViaEmail(difficulty, colour) {
   return withScriptLock(() => startNewGameInternal_(difficulty, colour));
 }
 
-// Note: Removed daily nudge function - game is now fully asynchronous and email-driven
-
 // --- TRIGGERS ---
 function setupTriggers() {
   preflight();
@@ -1118,34 +1171,30 @@ function quickStart() {
   auditLog('SETUP_START', {}, 'INFO');
 
   try {
-    // Step 1: Initialize sheet
     Logger.log('1/4 Initializing GameState sheet...');
     initialiseSheet();
 
-    // Step 2: Validate API key and email
     Logger.log('2/4 Validating API key and email...');
     preflight();
 
-    // Step 3: Set up triggers
     Logger.log('3/4 Setting up triggers...');
     setupTriggers();
 
-    // Step 4: Start first game
     Logger.log('4/4 Starting first game...');
     startNewGameViaEmail(CONFIG.DIFFICULTY, CONFIG.PLAYER_COLOUR);
 
     auditLog('SETUP_COMPLETE', {}, 'INFO');
     Logger.log('✅ Secure setup complete! Check your inbox for the first chess email.');
-    Logger.log('🔒 Security features enabled: audit logging, rate limiting, input validation');
+    Logger.log('🔒 Security features enabled: audit logging (bounded), rate limiting, input validation');
     Logger.log('📧 The thread will be labeled "chess-claude" and archived automatically.');
     Logger.log('♟️  Reply with your move to play! (Move must be the first word.)');
   } catch (e) {
-    auditLog('SETUP_ERROR', { error: e.toString() }, 'CRITICAL');
+    auditLog('SETUP_ERROR', { error: String(e) }, 'CRITICAL');
     throw e;
   }
 }
 
-// Add this function to view audit logs
+// View persisted audit logs (bounded by retention)
 function viewAuditLogs() {
   const props = PropertiesService.getScriptProperties();
   const keys = props.getKeys();
@@ -1156,8 +1205,8 @@ function viewAuditLogs() {
       try {
         const log = JSON.parse(props.getProperty(key));
         logs.push(log);
-      } catch (e) {
-        // Skip invalid entries
+      } catch (_) {
+        // skip
       }
     }
   }

@@ -1,6 +1,12 @@
 # Email Chess ♟️
 
+[![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-4285F4?logo=google&logoColor=white)](https://script.google.com/)
+[![Claude API](https://img.shields.io/badge/Claude%20API-191919?logo=anthropic&logoColor=white)](https://www.anthropic.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Play asynchronous correspondence chess against Claude AI entirely through email. Make moves at your own pace - the game waits for you!
+
+**Designed for use with a physical chess board** - emails contain move history in algebraic notation, perfect for following along on a real board.
 
 ## Features
 
@@ -118,11 +124,13 @@ Run these in order:
 - ⚡ Moves are processed within 5 minutes typically
 - 🎯 Claude provides commentary based on difficulty level
 - 🔄 You can have one active game at a time
+- 💰 API cost: Roughly $0.10–0.30 per full game
+- 🤖 **Game analysis with AI**: Make your GameState sheet public (Share → Anyone with the link can view) and share the link with any LLM chatbot. Ask it to analyze your position, suggest strategies, or explain opening theory based on your current game!
 
 ## FAQ
 
 **Q: Can I change difficulty mid-game?**
-A: No, start a new game with the NEW command.
+A: Not recommended, but you can edit cell B5 in the GameState sheet. Better to start a new game with the NEW command.
 
 **Q: How do I castle?**
 A: Use O-O for kingside, O-O-O for queenside.
