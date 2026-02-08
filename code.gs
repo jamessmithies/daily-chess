@@ -1,5 +1,5 @@
 // ============================================================
-// EMAIL CHESS — Security Hardened Version
+// EMAIL CHESS
 // ============================================================
 // Play asynchronous correspondence chess against Claude via email.
 // The script polls Gmail for your moves and responds with Claude's
