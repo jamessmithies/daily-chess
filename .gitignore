@@ -1,0 +1,20 @@
+# Google Apps Script local files
+.clasp.json
+.claspignore
+
+# Claude Code settings
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
