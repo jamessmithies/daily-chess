@@ -1,15 +1,20 @@
 // ============================================================
-// DAILY CHESS WITH CLAUDE — Google Apps Script (Email Only)
+// EMAIL CHESS — Security Hardened Version
 // ============================================================
-// Play a daily correspondence chess game against Claude via email.
-// A daily trigger sends Claude's move or a nudge. You reply with
-// your move in algebraic notation. The script polls Gmail for
-// replies and responds with Claude's next move in the same thread.
+// Play asynchronous correspondence chess against Claude via email.
+// The script polls Gmail for your moves and responds with Claude's
+// moves in the same thread. Fully email-driven after the first game.
+//
+// Security Features:
+//   - Enhanced input validation and sanitization
+//   - Comprehensive audit logging
+//   - Rate limiting and abuse prevention
+//   - Secure error handling
 //
 // Commands (must be the first word in your reply):
 //   NEW       — start a new game
 //   RESIGN    — resign the current game
-//   PAUSE     — pause daily emails (e.g. holiday)
+//   PAUSE     — pause the game
 //   CONTINUE  — resume after a pause
 //
 // Quick Setup:
@@ -28,14 +33,31 @@
 //   5. Run startFirstGame()
 // ============================================================
 
+// --- SECURITY CONFIGURATION ---
+const SECURITY_CONFIG = {
+  // Enable security features
+  ENABLE_AUDIT_LOGGING: true,
+  ENABLE_STRICT_VALIDATION: true,
+
+  // Rate limiting (more granular)
+  MAX_MOVES_PER_HOUR: 20,
+  MAX_COMMANDS_PER_DAY: 50,
+  MAX_FAILED_ATTEMPTS: 5,
+  LOCKOUT_DURATION_MS: 3600000, // 1 hour
+
+  // Input constraints (stricter)
+  MAX_INPUT_LENGTH: 100,
+  ALLOWED_MOVE_PATTERN: /^[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?$/,
+  ALLOWED_COMMANDS: ['NEW', 'RESIGN', 'PAUSE', 'CONTINUE'],
+};
+
 // --- CONFIGURATION ---
 const CONFIG = {
   ANTHROPIC_API_KEY: PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY'),
   EMAIL: PropertiesService.getScriptProperties().getProperty('EMAIL'),
   DIFFICULTY: 'intermediate',   // beginner | intermediate | advanced
   PLAYER_COLOUR: 'white',       // white | black
-  DAILY_HOUR: 9,                // Hour (24h) for daily email
-  POLL_MINUTES: 5,              // How often to check for replies
+  POLL_MINUTES: 5,              // How often to check for email replies
   MODEL: 'claude-sonnet-4-5-20250929',
   THREAD_LABEL: 'chess-claude', // Gmail label to track the game thread
   AUTO_ARCHIVE: true,           // Automatically archive threads (remove from inbox)
@@ -44,8 +66,17 @@ const CONFIG = {
   MAX_FEN_LEN: 200,
   MAX_COMMENT_LEN: 1500,
   MAX_MOVEHIST_LEN: 6000,
-  MIN_CLAUDE_CALL_MS: 2000,  // Minimum time between API calls (2 seconds)
-  INTER_CALL_DELAY_MS: 2000, // Delay between validation and response calls
+
+  // Claude call controls
+  MIN_CLAUDE_CALL_MS: 2000,      // Minimum time between API calls
+  INTER_CALL_DELAY_MS: 1200,     // Delay between validation and response calls
+
+  // Token budgets (responses are tiny JSON)
+  MAX_TOKENS_CLAUDE_MOVE: 220,
+  MAX_TOKENS_VALIDATE_MOVE: 220,
+
+  // Simple spend control
+  MAX_CLAUDE_CALLS_PER_DAY: 200,
 };
 
 const NOTATION_GUIDE = `
@@ -64,16 +95,135 @@ If two pieces can reach the same square, add the file or rank:
   Rae1 = rook on a-file to e1, R1e2 = rook on rank 1 to e2
 `;
 
+// --- SECURITY HELPERS ---
+
+/**
+ * Audit logging for security events
+ */
+function auditLog(event, details, severity = 'INFO') {
+  if (!SECURITY_CONFIG.ENABLE_AUDIT_LOGGING) return;
+
+  const log = {
+    timestamp: new Date().toISOString(),
+    event: event,
+    severity: severity,
+    details: details,
+    user: Session.getEffectiveUser().getEmail(),
+  };
+
+  console.log(JSON.stringify(log));
+
+  // Store critical events
+  if (severity === 'CRITICAL' || severity === 'ERROR') {
+    const props = PropertiesService.getScriptProperties();
+    const auditKey = 'AUDIT_' + Date.now();
+    props.setProperty(auditKey, JSON.stringify(log));
+  }
+}
+
+/**
+ * Check for rate limit violations
+ */
+function checkRateLimit(type, identifier) {
+  const props = PropertiesService.getScriptProperties();
+  const now = Date.now();
+  const window = 3600000; // 1 hour window
+
+  // Check lockout
+  const lockoutKey = `LOCKOUT_${identifier}`;
+  const lockoutUntil = parseInt(props.getProperty(lockoutKey) || '0', 10);
+  if (lockoutUntil > now) {
+    auditLog('RATE_LIMIT_LOCKOUT', { type, identifier }, 'WARNING');
+    throw new Error('Account temporarily locked due to suspicious activity');
+  }
+
+  // Track attempts
+  const attemptKey = `ATTEMPTS_${type}_${identifier}_${Math.floor(now / window)}`;
+  const attempts = parseInt(props.getProperty(attemptKey) || '0', 10) + 1;
+  props.setProperty(attemptKey, String(attempts));
+
+  let limit;
+  switch (type) {
+    case 'MOVE': limit = SECURITY_CONFIG.MAX_MOVES_PER_HOUR; break;
+    case 'COMMAND': limit = SECURITY_CONFIG.MAX_COMMANDS_PER_DAY; break;
+    case 'FAILED': limit = SECURITY_CONFIG.MAX_FAILED_ATTEMPTS; break;
+    default: limit = 10;
+  }
+
+  if (attempts > limit) {
+    // Apply lockout
+    props.setProperty(lockoutKey, String(now + SECURITY_CONFIG.LOCKOUT_DURATION_MS));
+    auditLog('RATE_LIMIT_EXCEEDED', { type, identifier, attempts, limit }, 'CRITICAL');
+    throw new Error('Rate limit exceeded. Please try again later.');
+  }
+
+  return attempts;
+}
+
+/**
+ * Sanitize input more aggressively
+ */
+function sanitizeInput(input, maxLength = SECURITY_CONFIG.MAX_INPUT_LENGTH) {
+  if (typeof input !== 'string') return '';
+
+  // Remove all control characters and non-printable characters
+  let sanitized = input.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+
+  // Remove potential script injection patterns
+  sanitized = sanitized.replace(/<[^>]*>/g, '');
+  sanitized = sanitized.replace(/javascript:/gi, '');
+  sanitized = sanitized.replace(/on\w+\s*=/gi, '');
+
+  // Limit length
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength);
+  }
+
+  return sanitized.trim();
+}
+
+/**
+ * Validate chess move with strict pattern matching
+ */
+function validateMovePattern(move) {
+  if (!SECURITY_CONFIG.ENABLE_STRICT_VALIDATION) return true;
+
+  // Strict pattern for algebraic notation
+  const validPatterns = [
+    /^[a-h][1-8]$/, // Pawn move
+    /^[a-h]x[a-h][1-8]$/, // Pawn capture
+    /^[KQRBN][a-h][1-8]$/, // Piece move
+    /^[KQRBN]x[a-h][1-8]$/, // Piece capture
+    /^[KQRBN][a-h]x?[a-h][1-8]$/, // Piece move with file disambiguation
+    /^[KQRBN][1-8]x?[a-h][1-8]$/, // Piece move with rank disambiguation
+    /^O-O$/, // Kingside castle
+    /^O-O-O$/, // Queenside castle
+    /^[a-h][18]=[QRBN]$/, // Pawn promotion
+    /^[a-h]x[a-h][18]=[QRBN]$/, // Pawn capture with promotion
+  ];
+
+  // Remove check/checkmate indicators for validation
+  const cleanMove = move.replace(/[+#]$/, '');
+
+  return validPatterns.some(pattern => pattern.test(cleanMove));
+}
+
 // --- UTIL HELPERS ---
 function getAccountEmail() {
   const e = (Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
-  if (!e) throw new Error('Could not determine account email (Session.getEffectiveUser()).');
+  if (!e) {
+    auditLog('EMAIL_ERROR', 'Could not determine account email', 'ERROR');
+    throw new Error('Configuration error. Please contact administrator.');
+  }
   return e;
 }
 
 function getDestinationEmail() {
   const e = (CONFIG.EMAIL || Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
-  if (!e) throw new Error('Destination email is not set and could not determine account email.');
+  if (!e) {
+    auditLog('EMAIL_ERROR', 'Destination email not set', 'ERROR');
+    throw new Error('Configuration error. Please contact administrator.');
+  }
   return e;
 }
 
@@ -83,15 +233,56 @@ function normalizeEmail(fromField) {
   return (m ? m[1] : s).trim().toLowerCase();
 }
 
-function onlyMeGuard(message) {
+/**
+ * Enhanced sender verification with multiple security checks
+ * - Header-based allowlist
+ * - Gmail query verification for "from:me" messages
+ * - Audit logging for security events
+ */
+function onlyMeGuard(message, thread) {
   const allowed = getAccountEmail();
   const sender = normalizeEmail(message.getFrom());
-  return sender === allowed;
+
+  // Check 1: Basic sender match
+  if (sender !== allowed) {
+    auditLog('SENDER_MISMATCH', { sender, allowed }, 'WARNING');
+    return false;
+  }
+
+  // Check 2: Verify thread contains from:me messages
+  try {
+    if (thread && thread.getId) {
+      const id = thread.getId();
+      const d = message.getDate();
+      const after = Utilities.formatDate(
+        new Date(d.getTime() - 86400000),
+        Session.getScriptTimeZone(),
+        'yyyy/MM/dd'
+      );
+      const q = `in:anywhere thread:${id} from:me after:${after}`;
+      const hits = GmailApp.search(q, 0, 1);
+      if (!hits || hits.length === 0) {
+        auditLog('THREAD_VERIFICATION_FAILED', { threadId: id }, 'WARNING');
+        return false;
+      }
+    }
+  } catch (e) {
+    auditLog('THREAD_VERIFICATION_ERROR', { error: e.toString() }, 'ERROR');
+    if (thread) return false;
+  }
+
+  return true;
 }
 
 function withScriptLock(fn) {
   const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    auditLog('LOCK_TIMEOUT', { error: e.toString() }, 'ERROR');
+    throw new Error('System busy. Please try again.');
+  }
+
   try {
     return fn();
   } finally {
@@ -104,7 +295,8 @@ function enforceRateLimit(propertyKey, minMs) {
   const now = Date.now();
   const last = parseInt(props.getProperty(propertyKey) || '0', 10);
   if (last && now - last < minMs) {
-    throw new Error(`Rate limited: wait ${Math.ceil((minMs - (now - last)) / 1000)}s and try again.`);
+    auditLog('API_RATE_LIMITED', { propertyKey, waitTime: minMs - (now - last) }, 'WARNING');
+    throw new Error('Please wait before trying again.');
   }
   props.setProperty(propertyKey, String(now));
 }
@@ -113,8 +305,12 @@ function getOrCreateGameToken() {
   const props = PropertiesService.getScriptProperties();
   let token = props.getProperty('CHESS_GAME_TOKEN');
   if (!token) {
-    token = Utilities.getUuid();
+    // Use cryptographically secure random token
+    const bytes = Utilities.newBlob(Utilities.getUuid()).getBytes();
+    const hash = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes);
+    token = Utilities.base64Encode(hash).substring(0, 16);
     props.setProperty('CHESS_GAME_TOKEN', token);
+    auditLog('GAME_TOKEN_CREATED', { token }, 'INFO');
   }
   return token;
 }
@@ -125,7 +321,7 @@ function buildSubject(prefix) {
 }
 
 function safeTrim(s, maxLen) {
-  s = String(s ?? '');
+  s = sanitizeInput(String(s ?? ''), maxLen + 100); // Sanitize first with buffer
   if (s.length > maxLen) return s.slice(0, maxLen);
   return s;
 }
@@ -134,6 +330,12 @@ function isValidFen(fen) {
   if (typeof fen !== 'string') return false;
   fen = fen.trim();
   if (!fen || fen.length > CONFIG.MAX_FEN_LEN) return false;
+
+  // Check for injection attempts
+  if (fen.includes('<') || fen.includes('>') || fen.includes('javascript:')) {
+    auditLog('FEN_INJECTION_ATTEMPT', { fen }, 'CRITICAL');
+    return false;
+  }
 
   const parts = fen.split(/\s+/);
   if (parts.length < 4) return false;
@@ -153,17 +355,48 @@ function isValidFen(fen) {
   const ranks = board.split('/');
   if (ranks.length !== 8) return false;
 
+  let whiteKings = 0;
+  let blackKings = 0;
+
   for (const r of ranks) {
     let count = 0;
     for (const ch of r) {
       if (ch >= '1' && ch <= '8') count += parseInt(ch, 10);
-      else if ('pnbrqkPNBRQK'.includes(ch)) count += 1;
+      else if ('pnbrqkPNBRQK'.includes(ch)) {
+        count += 1;
+        if (ch === 'K') whiteKings++;
+        if (ch === 'k') blackKings++;
+      }
       else return false;
     }
     if (count !== 8) return false;
   }
 
+  // Each side must have exactly one king
+  if (whiteKings !== 1 || blackKings !== 1) {
+    auditLog('INVALID_FEN_KINGS', { whiteKings, blackKings }, 'WARNING');
+    return false;
+  }
+
   return true;
+}
+
+// --- API BUDGET HELPERS ---
+function todayKey_() {
+  // YYYY-MM-DD in script TZ
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+function bumpClaudeDailyCount_() {
+  const props = PropertiesService.getScriptProperties();
+  const key = 'CHESS_CLAUDE_COUNT_' + todayKey_();
+  const count = parseInt(props.getProperty(key) || '0', 10) + 1;
+  props.setProperty(key, String(count));
+  if (count > CONFIG.MAX_CLAUDE_CALLS_PER_DAY) {
+    auditLog('CLAUDE_DAILY_LIMIT_EXCEEDED', { count }, 'ERROR');
+    throw new Error('Daily API limit reached. Try again tomorrow.');
+  }
+  return count;
 }
 
 // --- SHEET HELPERS ---
@@ -188,8 +421,15 @@ function getGameState() {
 
 function saveGameState(state) {
   const sheet = getSheet();
+
+  // Validate state before saving
+  if (!isValidFen(state.fen)) {
+    auditLog('INVALID_STATE_SAVE_ATTEMPT', { fen: state.fen }, 'ERROR');
+    throw new Error('Invalid game state');
+  }
+
   sheet.getRange('B1').setValue(state.fen);
-  sheet.getRange('B2').setValue(state.moveHistory);
+  sheet.getRange('B2').setValue(safeTrim(state.moveHistory, CONFIG.MAX_MOVEHIST_LEN));
   sheet.getRange('B3').setValue(state.gameActive);
   sheet.getRange('B4').setValue(state.moveNumber);
   sheet.getRange('B5').setValue(state.difficulty);
@@ -201,6 +441,8 @@ function saveGameState(state) {
 
 // --- INITIALISE ---
 function initialiseSheet() {
+  auditLog('SHEET_INIT_START', {}, 'INFO');
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName('GameState');
   if (!sheet) sheet = ss.insertSheet('GameState');
@@ -233,6 +475,7 @@ function initialiseSheet() {
 
   getOrCreateGameToken();
 
+  auditLog('SHEET_INIT_COMPLETE', {}, 'INFO');
   Logger.log('Sheet initialised. Run setupTriggers() next.');
 }
 
@@ -240,7 +483,14 @@ function initialiseSheet() {
 function validateApiKey() {
   const key = CONFIG.ANTHROPIC_API_KEY;
   if (!key || key === 'YOUR_API_KEY_HERE' || String(key).trim() === '') {
-    throw new Error('ANTHROPIC_API_KEY is not set. Add it in Project Settings → Script Properties.');
+    auditLog('API_KEY_MISSING', {}, 'ERROR');
+    throw new Error('API key not configured. Please check settings.');
+  }
+
+  // Validate key format (basic check)
+  if (!/^sk-ant-/.test(key)) {
+    auditLog('API_KEY_INVALID_FORMAT', {}, 'ERROR');
+    throw new Error('API key format invalid.');
   }
 
   const url = 'https://api.anthropic.com/v1/messages';
@@ -263,44 +513,57 @@ function validateApiKey() {
 
   const response = UrlFetchApp.fetch(url, options);
   const code = response.getResponseCode();
-  const text = response.getContentText();
 
-  let json = null;
-  try { json = JSON.parse(text); } catch (_) {}
-
-  if (code === 401) throw new Error('ANTHROPIC_API_KEY is invalid (401 Unauthorized). Check Script Properties.');
-  if (code === 403) throw new Error('ANTHROPIC_API_KEY is forbidden (403). The key may be disabled or restricted.');
-  if (code === 429) throw new Error('Anthropic API rate-limited during validation (429). Try again shortly.');
+  if (code === 401) {
+    auditLog('API_KEY_UNAUTHORIZED', {}, 'ERROR');
+    throw new Error('API key invalid or expired.');
+  }
+  if (code === 403) {
+    auditLog('API_KEY_FORBIDDEN', {}, 'ERROR');
+    throw new Error('API key access denied.');
+  }
+  if (code === 429) {
+    auditLog('API_RATE_LIMITED', {}, 'WARNING');
+    throw new Error('API rate limited. Try again later.');
+  }
   if (code >= 500) {
-    Logger.log('Anthropic API returned ' + code + ' during validation — may be temporary. Proceeding.');
+    auditLog('API_SERVER_ERROR', { code }, 'WARNING');
+    Logger.log('API server error during validation. Proceeding with caution.');
     return true;
   }
   if (code >= 200 && code < 300) {
+    auditLog('API_KEY_VALIDATED', {}, 'INFO');
     Logger.log('API key validated successfully.');
     return true;
   }
 
-  const msg = (json && json.error && json.error.message) ? json.error.message : ('HTTP ' + code);
-  throw new Error('Unexpected response during API key validation: ' + msg);
+  auditLog('API_UNEXPECTED_RESPONSE', { code }, 'ERROR');
+  throw new Error('Unexpected API response.');
 }
 
 function preflight() {
   Logger.log('Account email (sender allowlist): ' + getAccountEmail());
   Logger.log('Destination email: ' + getDestinationEmail());
   validateApiKey();
+  auditLog('PREFLIGHT_COMPLETE', {}, 'INFO');
   Logger.log('Preflight passed. Ready to play.');
 }
 
 // --- CLAUDE API ---
-function callClaude(systemPrompt, userMessage) {
+function callClaude(systemPrompt, userMessage, maxTokens) {
+  bumpClaudeDailyCount_();
   enforceRateLimit('CHESS_LAST_CLAUDE_CALL_MS', CONFIG.MIN_CLAUDE_CALL_MS);
+
+  // Sanitize inputs to prevent prompt injection
+  userMessage = sanitizeInput(userMessage, 5000);
 
   const url = 'https://api.anthropic.com/v1/messages';
   const payload = {
     model: CONFIG.MODEL,
-    max_tokens: 1024,
+    max_tokens: maxTokens,
     system: systemPrompt,
     messages: [{ role: 'user', content: userMessage }],
+    temperature: 0.3, // Lower temperature for more consistent responses
   };
 
   const options = {
@@ -321,18 +584,25 @@ function callClaude(systemPrompt, userMessage) {
   let json;
   try {
     json = JSON.parse(text);
-  } catch (_) {
-    throw new Error(`Claude API returned non-JSON (HTTP ${code}).`);
+  } catch (e) {
+    auditLog('CLAUDE_PARSE_ERROR', { code, error: e.toString() }, 'ERROR');
+    throw new Error('API communication error.');
   }
 
   if (code < 200 || code >= 300) {
     const msg = (json && json.error && json.error.message) ? json.error.message : `HTTP ${code}`;
-    throw new Error('Claude API error: ' + msg);
+    auditLog('CLAUDE_API_ERROR', { code, message: msg }, 'ERROR');
+    throw new Error('API error. Please try again.');
   }
 
-  if (json.error) throw new Error('Claude API error: ' + json.error.message);
+  if (json.error) {
+    auditLog('CLAUDE_RESPONSE_ERROR', { error: json.error.message }, 'ERROR');
+    throw new Error('API processing error.');
+  }
+
   if (!json.content || !json.content[0] || typeof json.content[0].text !== 'string') {
-    throw new Error('Claude API error: unexpected response shape.');
+    auditLog('CLAUDE_INVALID_RESPONSE', {}, 'ERROR');
+    throw new Error('Invalid API response.');
   }
 
   return json.content[0].text;
@@ -347,13 +617,14 @@ function getChessSystemPrompt(state) {
 
   return `You are a chess engine and tutor. You are playing ${state.playerColour === 'white' ? 'black' : 'white'}.
 
-RULES:
-- You receive the current FEN position and move history.
-- Respond with EXACTLY this JSON format, no markdown fencing, no other text:
-{"move":"e4","fen":"<updated FEN after your move>","comment":"<your comment>","gameOver":false,"result":""}
-- Use standard algebraic notation for moves (e.g., e4, Nf3, O-O, Qxd7+, e8=Q).
-- If the game is over (checkmate, stalemate, draw), set gameOver to true and result to the outcome.
-- Validate that your move is legal in the given position.
+CRITICAL RULES:
+- You MUST respond with EXACTLY this JSON format, no markdown fencing, no other text:
+{"move":"<move>","fen":"<updated FEN>","comment":"<comment>","gameOver":<bool>,"result":"<result>"}
+- The move MUST be in standard algebraic notation ONLY
+- The FEN MUST be valid and represent the position after your move
+- NEVER include any text outside the JSON object
+- NEVER use markdown code fences
+- Validate that your move is legal in the given position
 
 DIFFICULTY: ${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}
 
@@ -386,19 +657,43 @@ function generateTextBoard(fen) {
 
 // --- CORE GAME LOGIC ---
 function parseClaudeJson(responseText) {
-  const cleaned = String(responseText || '').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-  const parsed = JSON.parse(cleaned);
+  // Remove any potential markdown or extra text
+  const cleaned = String(responseText || '')
+    .replace(/```json\n?/g, '')
+    .replace(/```\n?/g, '')
+    .replace(/^[^{]*/, '')  // Remove everything before first {
+    .replace(/[^}]*$/, '')  // Remove everything after last }
+    .trim();
 
-  if (!parsed || typeof parsed !== 'object') throw new Error('Claude returned non-object JSON.');
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    auditLog('CLAUDE_JSON_PARSE_FAILED', { response: responseText }, 'ERROR');
+    throw new Error('Invalid response format');
+  }
 
+  if (!parsed || typeof parsed !== 'object') {
+    auditLog('CLAUDE_INVALID_OBJECT', {}, 'ERROR');
+    throw new Error('Invalid response structure');
+  }
+
+  // Strict validation
   const move = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
   const fen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
   const comment = safeTrim(parsed.comment, CONFIG.MAX_COMMENT_LEN);
   const gameOver = Boolean(parsed.gameOver);
   const result = safeTrim(parsed.result, 200);
 
-  if (!move || typeof move !== 'string') throw new Error('Claude returned missing/invalid move.');
-  if (!fen || !isValidFen(fen)) throw new Error('Claude returned invalid FEN.');
+  if (!move || typeof move !== 'string' || !validateMovePattern(move)) {
+    auditLog('CLAUDE_INVALID_MOVE', { move }, 'ERROR');
+    throw new Error('Invalid move received');
+  }
+
+  if (!fen || !isValidFen(fen)) {
+    auditLog('CLAUDE_INVALID_FEN', { fen }, 'ERROR');
+    throw new Error('Invalid position received');
+  }
 
   return { move, fen, comment, gameOver, result };
 }
@@ -411,14 +706,14 @@ function getClaudeMove() {
   const userMessage =
     `Current FEN: ${state.fen}\nMove history: ${state.moveHistory || '(game start)'}\nIt is your turn.`;
 
-  const responseText = callClaude(systemPrompt, userMessage);
+  const responseText = callClaude(systemPrompt, userMessage, CONFIG.MAX_TOKENS_CLAUDE_MOVE);
 
   let parsed;
   try {
     parsed = parseClaudeJson(responseText);
   } catch (e) {
-    Logger.log('Failed to parse/validate Claude response: ' + String(e && e.message ? e.message : e));
-    throw new Error('Invalid response from Claude (rejected for safety).');
+    Logger.log('Failed to parse Claude response: ' + e.toString());
+    throw new Error('Unable to process move. Please try again.');
   }
 
   const claudeColour = state.playerColour === 'white' ? 'black' : 'white';
@@ -434,17 +729,36 @@ function getClaudeMove() {
   if (parsed.gameOver) state.gameActive = false;
 
   saveGameState(state);
+  auditLog('CLAUDE_MOVE', { move: parsed.move }, 'INFO');
   return parsed;
 }
 
 function processPlayerMove(moveStr) {
   const state = getGameState();
+  const email = getAccountEmail();
 
-  if (!state.gameActive) return { error: 'No active game. Reply NEW to start one.' };
+  if (!state.gameActive) {
+    return { error: 'No active game. Reply NEW to start one.' };
+  }
 
-  moveStr = String(moveStr || '').trim();
-  if (!moveStr) return { error: 'Empty move. Reply with a move like Nf3 or e4.' };
-  if (moveStr.length > CONFIG.MAX_MOVE_LEN) return { error: 'Move too long. Use standard algebraic notation (e.g., Nf3).' };
+  moveStr = sanitizeInput(String(moveStr || '').trim(), CONFIG.MAX_MOVE_LEN);
+  if (!moveStr) {
+    return { error: 'Empty move. Reply with a move like Nf3 or e4.' };
+  }
+
+  // Rate limit check
+  try {
+    checkRateLimit('MOVE', email);
+  } catch (e) {
+    return { error: e.toString() };
+  }
+
+  // Validate move pattern
+  if (!validateMovePattern(moveStr)) {
+    checkRateLimit('FAILED', email);
+    auditLog('INVALID_MOVE_PATTERN', { move: moveStr }, 'WARNING');
+    return { error: 'Invalid move format. Use standard algebraic notation.' };
+  }
 
   const systemPrompt = `You are a chess position manager. The player is playing ${state.playerColour}.
 
@@ -454,27 +768,44 @@ TASK: Validate the player's move and return the updated position.
 
 Respond ONLY with the JSON object, no markdown fencing.`;
 
-  const userMessage =
-    `Current FEN: ${state.fen}\nMove history: ${state.moveHistory || '(game start)'}\nPlayer's move: ${moveStr}`;
+  const userMessage = `Current FEN: ${state.fen}\nPlayer's move: ${moveStr}`;
 
-  const responseText = callClaude(systemPrompt, userMessage);
+  const responseText = callClaude(systemPrompt, userMessage, CONFIG.MAX_TOKENS_VALIDATE_MOVE);
 
   let parsed;
   try {
-    const cleaned = String(responseText || '').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const cleaned = String(responseText || '')
+      .replace(/```json\n?/g, '')
+      .replace(/```\n?/g, '')
+      .replace(/^[^{]*/, '')
+      .replace(/[^}]*$/, '')
+      .trim();
     parsed = JSON.parse(cleaned);
-  } catch (_) {
+  } catch (e) {
+    auditLog('MOVE_VALIDATION_PARSE_ERROR', { error: e.toString() }, 'ERROR');
     return { error: 'Failed to process move. Try again.' };
   }
 
-  if (!parsed || typeof parsed !== 'object') return { error: 'Failed to process move. Try again.' };
-  if (!parsed.valid) return { error: 'Illegal move: ' + safeTrim(parsed.reason, 200) };
+  if (!parsed || typeof parsed !== 'object' || typeof parsed.valid !== 'boolean') {
+    return { error: 'Failed to process move. Try again.' };
+  }
+
+  if (!parsed.valid) {
+    checkRateLimit('FAILED', email);
+    auditLog('ILLEGAL_MOVE', { move: moveStr, reason: parsed.reason }, 'WARNING');
+    return { error: 'Illegal move: ' + safeTrim(parsed.reason, 200) };
+  }
 
   const nextFen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
   const stdMove = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
 
-  if (!isValidFen(nextFen)) return { error: 'Move processing returned invalid position. Try again.' };
-  if (!stdMove) return { error: 'Move processing returned invalid move. Try again.' };
+  if (!isValidFen(nextFen)) {
+    return { error: 'Move processing error. Try again.' };
+  }
+
+  if (!stdMove || !validateMovePattern(stdMove)) {
+    return { error: 'Move processing error. Try again.' };
+  }
 
   const movePrefix = state.playerColour === 'white' ? state.moveNumber + '.' : state.moveNumber + '...';
   state.fen = nextFen;
@@ -485,6 +816,7 @@ Respond ONLY with the JSON object, no markdown fencing.`;
   if (state.playerColour === 'black') state.moveNumber++;
 
   saveGameState(state);
+  auditLog('PLAYER_MOVE', { move: stdMove }, 'INFO');
   return { success: true, move: stdMove, fen: nextFen };
 }
 
@@ -502,11 +834,6 @@ function sendGameEmail(subjectPrefix, body) {
       let label = GmailApp.getUserLabelByName(CONFIG.THREAD_LABEL);
       if (!label) label = GmailApp.createLabel(CONFIG.THREAD_LABEL);
       thread.addLabel(label);
-
-      // Automatically archive thread if configured
-      if (CONFIG.AUTO_ARCHIVE) {
-        thread.moveToArchive();
-      }
 
       state.lastProcessedCount = thread.getMessageCount();
       saveGameState(state);
@@ -557,7 +884,7 @@ function buildMoveEmail(claudeResponse) {
     body += `Reply with your move (e.g. Nf3, O-O, e4).\n`;
     body += `Reply NEW to start a new game.\n`;
     body += `Reply RESIGN to resign.\n`;
-    body += `Reply PAUSE to pause daily emails.\n`;
+    body += `Reply PAUSE to pause the game.\n`;
   }
 
   body += NOTATION_GUIDE;
@@ -594,19 +921,17 @@ function extractMoveFromReply(messageBody) {
   if (freshText.startsWith('No active game.')) return null;
   if (freshText.startsWith('Illegal move:')) return null;
 
-  const firstToken = freshText.split(/\s+/)[0].toUpperCase();
+  // Commands must be the FIRST token
+  const firstTokenRaw = freshText.split(/\s+/)[0];
+  const firstToken = firstTokenRaw.toUpperCase();
   if (firstToken === 'NEW') return { command: 'new' };
   if (firstToken === 'RESIGN') return { command: 'resign' };
   if (firstToken === 'PAUSE') return { command: 'pause' };
   if (firstToken === 'CONTINUE') return { command: 'continue' };
 
-  const movePattern = /\b(O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)\b/i;
-  const match = freshText.match(movePattern);
-  if (match) return { move: match[1] };
-
-  if (freshText.length <= 10 && /^[KQRBNPa-h0-9xO\-\+=#]+$/i.test(freshText)) {
-    return { move: freshText };
-  }
+  // Security hardening: moves must be the FIRST token only (no regex searching the full text)
+  const moveExact = /^(O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)$/i;
+  if (moveExact.test(firstTokenRaw)) return { move: firstTokenRaw };
 
   return null;
 }
@@ -627,7 +952,7 @@ function checkForReplies() {
     for (let i = startIdx; i < messages.length; i++) {
       const msg = messages[i];
 
-      if (!onlyMeGuard(msg)) {
+      if (!onlyMeGuard(msg, thread)) {
         Logger.log('Rejected reply from unauthorized sender: ' + msg.getFrom());
         continue;
       }
@@ -635,6 +960,8 @@ function checkForReplies() {
       const parsed = extractMoveFromReply(msg.getPlainBody());
       if (!parsed) continue;
 
+      // Mark as processed early to avoid re-processing on retries,
+      // but do NOT archive until after successful handling.
       state.lastProcessedCount = i + 1;
       saveGameState(state);
 
@@ -653,13 +980,16 @@ function checkForReplies() {
             state.moveHistory +
             '\n\nReply NEW to start a new game.'
         );
+        // Archive only after successful send
+        if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         return;
       }
 
       if (parsed.command === 'pause') {
         state.paused = true;
         saveGameState(state);
-        sendGameEmail('♟ Chess', 'Game paused. No daily emails until you resume.\n\nReply CONTINUE to resume.');
+        sendGameEmail('♟ Chess', 'Game paused. The game will wait for your next move.\n\nReply CONTINUE to resume.');
+        if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         return;
       }
 
@@ -673,20 +1003,17 @@ function checkForReplies() {
             state.moveHistory +
             '\n\nReply with your move.'
         );
+        if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         return;
       }
 
       if (state.paused) {
         sendGameEmail('♟ Chess', 'Game is paused. Reply CONTINUE to resume, or NEW to start a fresh game.');
+        if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         return;
       }
 
       if (parsed.move) {
-        // Archive the thread immediately after detecting your reply
-        if (CONFIG.AUTO_ARCHIVE) {
-          thread.moveToArchive();
-        }
-
         const result = processPlayerMove(parsed.move);
         if (result.error) {
           const cur = getGameState();
@@ -694,18 +1021,22 @@ function checkForReplies() {
             '♟ Chess',
             result.error +
               '\n\nMove history: ' + cur.moveHistory +
-              '\n\nTry again — reply with a valid move.'
+              '\n\nTry again — reply with a valid move (as the first word).'
           );
+          // Do not archive on errors; keep visible
           return;
         }
 
-        // Add delay between validation and response calls to avoid rate limiting
+        // Delay between validation and response calls to avoid rate limiting
         Utilities.sleep(CONFIG.INTER_CALL_DELAY_MS);
 
         const claudeResult = getClaudeMove();
         if (claudeResult) {
           const emailBody = 'Your move: ' + result.move + '\n\n' + buildMoveEmail(claudeResult);
           sendGameEmail('♟ Chess', emailBody);
+
+          // Archive only after we successfully sent our response
+          if (CONFIG.AUTO_ARCHIVE) thread.moveToArchive();
         }
         return;
       }
@@ -758,36 +1089,7 @@ function startNewGameViaEmail(difficulty, colour) {
   return withScriptLock(() => startNewGameInternal_(difficulty, colour));
 }
 
-// --- DAILY NUDGE ---
-function dailyRun() {
-  return withScriptLock(() => {
-    const state = getGameState();
-
-    if (state.paused) {
-      Logger.log('Game is paused. Skipping daily run.');
-      return;
-    }
-
-    if (!state.gameActive) {
-      sendGameEmail('♟ Chess', 'No active game. Reply NEW to start one.');
-      return;
-    }
-
-    const toMove = state.fen.split(' ')[1];
-    const claudeColour = state.playerColour === 'white' ? 'b' : 'w';
-
-    if (toMove === claudeColour) {
-      const result = getClaudeMove();
-      if (result) sendGameEmail('♟ Chess', buildMoveEmail(result));
-    } else {
-      let body = `It's your move!\n\n`;
-      body += `Move history: ${state.moveHistory}\n\n`;
-      body += `Reply with your move.\n`;
-      body += NOTATION_GUIDE;
-      sendGameEmail('♟ Chess', body);
-    }
-  });
-}
+// Note: Removed daily nudge function - game is now fully asynchronous and email-driven
 
 // --- TRIGGERS ---
 function setupTriggers() {
@@ -795,18 +1097,12 @@ function setupTriggers() {
 
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
 
-  ScriptApp.newTrigger('dailyRun')
-    .timeBased()
-    .everyDays(1)
-    .atHour(CONFIG.DAILY_HOUR)
-    .create();
-
   ScriptApp.newTrigger('checkForReplies')
     .timeBased()
     .everyMinutes(CONFIG.POLL_MINUTES)
     .create();
 
-  Logger.log('Triggers set: daily at ' + CONFIG.DAILY_HOUR + ':00, reply check every ' + CONFIG.POLL_MINUTES + ' mins.');
+  Logger.log('Trigger set: email polling every ' + CONFIG.POLL_MINUTES + ' minutes.');
 }
 
 // --- MANUAL START ---
@@ -818,25 +1114,60 @@ function startFirstGame() {
 // --- ONE-STEP SETUP ---
 // Run this ONCE to set up everything and start your first game
 function quickStart() {
-  Logger.log('🚀 Starting Quick Setup...');
+  Logger.log('🔒 Starting Secure Quick Setup...');
+  auditLog('SETUP_START', {}, 'INFO');
 
-  // Step 1: Initialize sheet
-  Logger.log('1/4 Initializing GameState sheet...');
-  initialiseSheet();
+  try {
+    // Step 1: Initialize sheet
+    Logger.log('1/4 Initializing GameState sheet...');
+    initialiseSheet();
 
-  // Step 2: Validate API key and email
-  Logger.log('2/4 Validating API key and email...');
-  preflight();
+    // Step 2: Validate API key and email
+    Logger.log('2/4 Validating API key and email...');
+    preflight();
 
-  // Step 3: Set up triggers
-  Logger.log('3/4 Setting up triggers...');
-  setupTriggers();
+    // Step 3: Set up triggers
+    Logger.log('3/4 Setting up triggers...');
+    setupTriggers();
 
-  // Step 4: Start first game
-  Logger.log('4/4 Starting first game...');
-  startNewGameViaEmail(CONFIG.DIFFICULTY, CONFIG.PLAYER_COLOUR);
+    // Step 4: Start first game
+    Logger.log('4/4 Starting first game...');
+    startNewGameViaEmail(CONFIG.DIFFICULTY, CONFIG.PLAYER_COLOUR);
 
-  Logger.log('✅ Setup complete! Check your inbox for the first chess email.');
-  Logger.log('📧 The thread will be labeled "chess-claude" and archived automatically.');
-  Logger.log('♟️  Reply with your move to play!');
+    auditLog('SETUP_COMPLETE', {}, 'INFO');
+    Logger.log('✅ Secure setup complete! Check your inbox for the first chess email.');
+    Logger.log('🔒 Security features enabled: audit logging, rate limiting, input validation');
+    Logger.log('📧 The thread will be labeled "chess-claude" and archived automatically.');
+    Logger.log('♟️  Reply with your move to play! (Move must be the first word.)');
+  } catch (e) {
+    auditLog('SETUP_ERROR', { error: e.toString() }, 'CRITICAL');
+    throw e;
+  }
+}
+
+// Add this function to view audit logs
+function viewAuditLogs() {
+  const props = PropertiesService.getScriptProperties();
+  const keys = props.getKeys();
+  const logs = [];
+
+  for (const key of keys) {
+    if (key.startsWith('AUDIT_')) {
+      try {
+        const log = JSON.parse(props.getProperty(key));
+        logs.push(log);
+      } catch (e) {
+        // Skip invalid entries
+      }
+    }
+  }
+
+  logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  Logger.log('=== SECURITY AUDIT LOGS ===');
+  logs.slice(0, 50).forEach(log => {
+    Logger.log(`[${log.timestamp}] ${log.severity}: ${log.event} - ${JSON.stringify(log.details)}`);
+  });
+
+  return logs;
 }
