@@ -19,9 +19,9 @@ Play correspondence chess against Claude AI through email. Make moves at your ow
 
 ## How it works
 - Set up the Google spreadsheet and app
-- You are emailed Claude's move (or you move first if playing white)
+- You are emailed Claude's move
 - You reply with your move in algebraic notation
-- The script polls Gmail every few minutes, picks up your reply, and emails back Claude's response in the same thread
+- The script polls Gmail at a user-defined interval, picks up your reply, and emails back Claude's response in the same thread
 - Game state lives in a Google Sheet that can be used to discuss your game with any AI chatbot
 - All chess emails are labeled "chess-claude" for easy filtering
 
@@ -127,9 +127,8 @@ Run these in order:
 
 ## Tips
 
-- 💡 The game thread stays in one email conversation
-- 📧 Emails stay in your inbox - delete or archive them as you prefer
-- ⚡ Moves are processed within 5 minutes typically
+- 📧 Emails stay in your Gmail app - delete or archive them as you prefer
+- ⚡ Moves are processed within 5 minutes by default
 - 🎯 Claude provides commentary based on difficulty level
 - 🔄 You can have one active game at a time
 - 💰 API cost: Roughly $0.10–0.30 per full game
@@ -156,13 +155,3 @@ A: One active game at a time per script instance.
 
 MIT License - See LICENSE file for details
 
-## Support
-
-For issues or questions:
-- Check the code comments for technical details
-- Review your Apps Script logs for errors
-- Ensure all setup steps were completed
-
----
-
-*Enjoy your games! Chess is best savored slowly. ♟️*
