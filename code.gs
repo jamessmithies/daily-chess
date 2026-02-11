@@ -544,7 +544,10 @@ Analyze the current position carefully and determine if this is a legal move.
 IMPORTANT RULES FOR MOVE INTERPRETATION:
 - If the move is just a square like "b3", "e4", "d5" (no piece letter), it's a PAWN move to that square
 - The move "b3" means: move the pawn that can legally reach b3 (usually the b-pawn moving forward)
-- For piece moves, they include the piece letter: "Nf3", "Be5", "Qd4"
+- For piece moves, they include the piece letter: "Nf3", "Be5", "Qd4", "Be2", "Bc4"
+  * "Be2" means: move a Bishop to e2 (find which Bishop can legally reach e2)
+  * Check ALL pieces of that type to see if any can make the move
+  * The destination square can be empty or occupied by an opponent's piece
 - Castling is written as "O-O" or "O-O-O"
 
 If this is a legal chess move in the current position:
@@ -556,10 +559,20 @@ If this is a legal chess move in the current position:
   * Example: If white plays b2-b4, set "b3" ONLY if black has a pawn on a4 or c4
   * Example: If black plays e7-e5, set "e6" ONLY if white has a pawn on d5 or f5
 
+PIECE MOVEMENT RULES TO VALIDATE:
+- Bishop: Moves diagonally any number of squares, path must be clear
+- Knight: Moves in L-shape (2+1 squares), can jump over pieces
+- Rook: Moves horizontally or vertically, path must be clear
+- Queen: Combines Bishop and Rook movement
+- King: Moves one square in any direction (check castling separately)
+
 If illegal:
 - Return: {"valid":false,"reason":"<why it's illegal>"}
 
-Double-check that pawn moves like "b3", "e4", "h6" are treated as pawn moves, not as invalid notation.
+CRITICAL VALIDATION NOTES:
+- For moves like "Be2", check if ANY Bishop can reach e2, not just one specific Bishop
+- Double-check that pawn moves like "b3", "e4", "h6" are treated as pawn moves
+- A square being empty doesn't make a move invalid - pieces can move to empty squares!
 Return ONLY the JSON, no other text.`;
 
   const userMessage =
