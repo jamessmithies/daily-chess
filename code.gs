@@ -129,6 +129,66 @@ function safeTrim(s, maxLen) {
   return s;
 }
 
+function correctEnPassantSquare(fen) {
+  // Validates and corrects the en passant square in a FEN string
+  const parts = fen.split(/\s+/);
+  if (parts.length !== 6) return fen;
+
+  const [board, activeColor, castling, enPassant, halfmove, fullmove] = parts;
+
+  // If already '-', nothing to validate
+  if (enPassant === '-') return fen;
+
+  // Parse the board to check if en passant is actually valid
+  const ranks = board.split('/');
+  const fileIdx = enPassant.charCodeAt(0) - 97; // a=0, b=1, etc.
+  const rank = parseInt(enPassant[1]);
+
+  // Determine which color just moved (opposite of active color)
+  const lastMoved = activeColor === 'w' ? 'black' : 'white';
+
+  let isValid = false;
+
+  // For en passant to be valid:
+  // 1. The last move must have been a two-square pawn advance
+  // 2. There must be an enemy pawn that can capture
+
+  if (lastMoved === 'white' && rank === 3) {
+    // White just moved a pawn to rank 4
+    // Check if there's a black pawn that could capture
+    const rank4 = expandRank(ranks[4]); // Rank 4 (0-indexed as 4)
+    if (fileIdx > 0 && rank4[fileIdx - 1] === 'p') isValid = true;
+    if (fileIdx < 7 && rank4[fileIdx + 1] === 'p') isValid = true;
+  } else if (lastMoved === 'black' && rank === 6) {
+    // Black just moved a pawn to rank 5
+    // Check if there's a white pawn that could capture
+    const rank5 = expandRank(ranks[3]); // Rank 5 (0-indexed as 3)
+    if (fileIdx > 0 && rank5[fileIdx - 1] === 'P') isValid = true;
+    if (fileIdx < 7 && rank5[fileIdx + 1] === 'P') isValid = true;
+  }
+
+  if (!isValid) {
+    Logger.log(`Correcting invalid en passant square '${enPassant}' to '-'`);
+    return `${board} ${activeColor} ${castling} - ${halfmove} ${fullmove}`;
+  }
+
+  return fen;
+}
+
+function expandRank(rankStr) {
+  // Expands a FEN rank string to an array of pieces
+  const result = [];
+  for (let i = 0; i < rankStr.length; i++) {
+    const ch = rankStr[i];
+    if (ch >= '1' && ch <= '8') {
+      for (let j = 0; j < parseInt(ch); j++) result.push('.');
+    } else {
+      result.push(ch);
+    }
+  }
+  return result;
+}
+
 function isValidFen(fen) {
   if (typeof fen !== 'string') return false;
   fen = fen.trim();
@@ -359,10 +419,15 @@ RULES:
   * Promotion: include '=' (e.g., "e8=Q")
   * Check/Checkmate: include '+' or '#' (e.g., "Qd7+", "Qf7#")
 - IMPORTANT: Always use capital letters for pieces: K, Q, R, B, N (never lowercase)
-- FEN FORMAT: The en passant square (4th field) should be "-" unless:
-  * A pawn just moved two squares forward AND
-  * An opponent pawn is positioned to capture it en passant
-  * Example: After 1.e4, if black has a pawn on d4 or f4, then e3 is the en passant square
+- FEN FORMAT: The en passant square (4th field) must be set correctly:
+  * Set to "-" in most cases (this is the default)
+  * ONLY set to a square (like "e6") when ALL these conditions are met:
+    1. A pawn JUST moved two squares forward on the previous move
+    2. An opponent pawn is on an adjacent file at the correct rank
+    3. That opponent pawn can legally capture en passant
+  * Example: After 1.e4, set to "e3" ONLY if black has a pawn on d4 or f4
+  * Example: After 1...e5, set to "e6" ONLY if white has a pawn on d5 or f5
+  * Common mistake: Setting en passant square when no capture is possible
 - If the game is over (checkmate, stalemate, draw), set gameOver to true and result to the outcome.
 - Validate that your move is legal in the given position.
 
@@ -435,6 +500,9 @@ function getClaudeMove() {
   const claudeColour = state.playerColour === 'white' ? 'black' : 'white';
   const movePrefix = claudeColour === 'white' ? state.moveNumber + '.' : state.moveNumber + '...';
 
+  // Validate and correct the en passant square if needed
+  parsed.fen = correctEnPassantSquare(parsed.fen);
+
   state.fen = parsed.fen;
   state.moveHistory = safeTrim(
     (state.moveHistory ? state.moveHistory + ' ' : '') + movePrefix + parsed.move,
@@ -481,7 +549,12 @@ IMPORTANT RULES FOR MOVE INTERPRETATION:
 
 If this is a legal chess move in the current position:
 - Return: {"valid":true,"fen":"<new FEN after the move>","move":"<standardized algebraic notation>"}
-- IMPORTANT: Set en passant square to "-" unless a pawn just moved two squares AND an opponent pawn can capture it
+- CRITICAL FEN RULES for en passant square (4th field):
+  * Default to "-" (this is correct 99% of the time)
+  * ONLY set to a square when the move being made is a pawn moving two squares
+  * AND there's an enemy pawn on an adjacent file that could capture
+  * Example: If white plays b2-b4, set "b3" ONLY if black has a pawn on a4 or c4
+  * Example: If black plays e7-e5, set "e6" ONLY if white has a pawn on d5 or f5
 
 If illegal:
 - Return: {"valid":false,"reason":"<why it's illegal>"}
@@ -515,8 +588,11 @@ Return ONLY the JSON, no other text.`;
 
   if (!parsed.valid) return { error: 'Illegal move: ' + safeTrim(parsed.reason, 200) };
 
-  const nextFen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
+  let nextFen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
   const stdMove = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
+
+  // Validate and correct the en passant square if needed
+  nextFen = correctEnPassantSquare(nextFen);
 
   if (!isValidFen(nextFen)) return { error: 'Move processing returned invalid position. Try again.' };
   if (!stdMove) return { error: 'Move processing returned invalid move. Try again.' };
