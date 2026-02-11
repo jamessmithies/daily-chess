@@ -1,0 +1,18 @@
+{
+  "name": "stockfish-cloud-function",
+  "version": "1.0.0",
+  "description": "Google Cloud Function wrapping Stockfish WASM for email-chess",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "npx @google-cloud/functions-framework --target=getMove",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.0.0",
+    "stockfish": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

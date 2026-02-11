@@ -1,10 +1,11 @@
 // ============================================================
-// DAILY CHESS WITH CLAUDE — Google Apps Script (Email Only)
+// EMAIL CHESS — Google Apps Script
 // ============================================================
-// Play a daily correspondence chess game against Claude via email.
-// A daily trigger sends Claude's move or a nudge. You reply with
-// your move in algebraic notation. The script polls Gmail for
-// replies and responds with Claude's next move in the same thread.
+// Play correspondence chess via email against Stockfish (hosted
+// on Google Cloud Functions). Claude provides optional teaching
+// commentary after each move. You reply with your move in
+// algebraic notation and the script responds with the engine's
+// next move in the same thread.
 //
 // Commands (must be the first word in your reply):
 //   NEW       — start a new game
@@ -13,30 +14,33 @@
 //   CONTINUE  — resume after a pause
 //
 // Quick Setup:
-//   1. Create a Google Sheet → Extensions → Apps Script → paste this
-//   2. Project Settings → Script Properties:
+//   1. Deploy the Stockfish Cloud Function (see stockfish-cloud-function/)
+//   2. Create a Google Sheet → Extensions → Apps Script → paste this + Chess.gs
+//   3. Project Settings → Script Properties:
 //        ANTHROPIC_API_KEY  — your key from console.anthropic.com
+//        STOCKFISH_URL      — your Cloud Function URL
 //        EMAIL              — your email address (optional; defaults
 //                             to your Google account email)
-//   3. (Optional) Edit CONFIG defaults below (difficulty, color, etc.)
-//   4. Run quickStart() — this does everything in one step!
+//   4. (Optional) Edit CONFIG defaults below (difficulty, color, etc.)
+//   5. Run quickStart() — this does everything in one step!
 //
 // Manual Setup (if you prefer step-by-step):
-//   1-2. Same as above
-//   3. Run initialiseSheet()
-//   4. Run setupTriggers()
-//   5. Run startFirstGame()
+//   1-3. Same as above
+//   4. Run initialiseSheet()
+//   5. Run setupTriggers()
+//   6. Run startFirstGame()
 // ============================================================
 
 // --- CONFIGURATION ---
 const CONFIG = {
   ANTHROPIC_API_KEY: PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY'),
   EMAIL: PropertiesService.getScriptProperties().getProperty('EMAIL'),
+  STOCKFISH_URL: PropertiesService.getScriptProperties().getProperty('STOCKFISH_URL'),
   DIFFICULTY: 'intermediate',   // beginner | intermediate | advanced
   PLAYER_COLOUR: 'white',       // white | black
   POLL_MINUTES: 5,              // How often to check for email replies
   MODEL: 'claude-sonnet-4-5-20250929',
-  THREAD_LABEL: 'chess-claude', // Gmail label to track the game thread
+  THREAD_LABEL: 'chess-game',   // Gmail label to track the game thread
   AUTO_ARCHIVE: true,           // Automatically archive threads after moves
 
   MAX_MOVE_LEN: 20,
@@ -44,7 +48,6 @@ const CONFIG = {
   MAX_COMMENT_LEN: 1500,
   MAX_MOVEHIST_LEN: 6000,
   MIN_CLAUDE_CALL_MS: 2000,  // Minimum time between API calls (2 seconds)
-  INTER_CALL_DELAY_MS: 2000, // Delay between validation and response calls
 };
 
 const NOTATION_GUIDE = `
@@ -129,100 +132,19 @@ function safeTrim(s, maxLen) {
   return s;
 }
 
-function correctEnPassantSquare(fen) {
-  // Validates and corrects the en passant square in a FEN string
-  const parts = fen.split(/\s+/);
-  if (parts.length !== 6) return fen;
-
-  const [board, activeColor, castling, enPassant, halfmove, fullmove] = parts;
-
-  // If already '-', nothing to validate
-  if (enPassant === '-') return fen;
-
-  // Parse the board to check if en passant is actually valid
-  const ranks = board.split('/');
-  const fileIdx = enPassant.charCodeAt(0) - 97; // a=0, b=1, etc.
-  const rank = parseInt(enPassant[1]);
-
-  // Determine which color just moved (opposite of active color)
-  const lastMoved = activeColor === 'w' ? 'black' : 'white';
-
-  let isValid = false;
-
-  // For en passant to be valid:
-  // 1. The last move must have been a two-square pawn advance
-  // 2. There must be an enemy pawn that can capture
-
-  if (lastMoved === 'white' && rank === 3) {
-    // White just moved a pawn to rank 4
-    // Check if there's a black pawn that could capture
-    const rank4 = expandRank(ranks[4]); // Rank 4 (0-indexed as 4)
-    if (fileIdx > 0 && rank4[fileIdx - 1] === 'p') isValid = true;
-    if (fileIdx < 7 && rank4[fileIdx + 1] === 'p') isValid = true;
-  } else if (lastMoved === 'black' && rank === 6) {
-    // Black just moved a pawn to rank 5
-    // Check if there's a white pawn that could capture
-    const rank5 = expandRank(ranks[3]); // Rank 5 (0-indexed as 3)
-    if (fileIdx > 0 && rank5[fileIdx - 1] === 'P') isValid = true;
-    if (fileIdx < 7 && rank5[fileIdx + 1] === 'P') isValid = true;
-  }
-
-  if (!isValid) {
-    Logger.log(`Correcting invalid en passant square '${enPassant}' to '-'`);
-    return `${board} ${activeColor} ${castling} - ${halfmove} ${fullmove}`;
-  }
-
-  return fen;
-}
-
-function expandRank(rankStr) {
-  // Expands a FEN rank string to an array of pieces
-  const result = [];
-  for (let i = 0; i < rankStr.length; i++) {
-    const ch = rankStr[i];
-    if (ch >= '1' && ch <= '8') {
-      for (let j = 0; j < parseInt(ch); j++) result.push('.');
-    } else {
-      result.push(ch);
-    }
-  }
-  return result;
-}
 
 function isValidFen(fen) {
   if (typeof fen !== 'string') return false;
   fen = fen.trim();
   if (!fen || fen.length > CONFIG.MAX_FEN_LEN) return false;
 
-  const parts = fen.split(/\s+/);
-  if (parts.length < 4) return false;
-
-  const board = parts[0];
-  const toMove = parts[1];
-  const castling = parts[2];
-  const ep = parts[3];
-
-  if (toMove !== 'w' && toMove !== 'b') return false;
-  if (castling !== '-') {
-    if (!/^[KQkq]{1,4}$/.test(castling)) return false;
-    if (new Set(castling.split('')).size !== castling.length) return false;
+  // Use chess.js to validate FEN
+  try {
+    const chess = new Chess(fen);
+    return true;
+  } catch (e) {
+    return false;
   }
-  if (!(ep === '-' || /^[a-h][36]$/.test(ep))) return false;
-
-  const ranks = board.split('/');
-  if (ranks.length !== 8) return false;
-
-  for (const r of ranks) {
-    let count = 0;
-    for (const ch of r) {
-      if (ch >= '1' && ch <= '8') count += parseInt(ch, 10);
-      else if ('pnbrqkPNBRQK'.includes(ch)) count += 1;
-      else return false;
-    }
-    if (count !== 8) return false;
-  }
-
-  return true;
 }
 
 // --- SHEET HELPERS ---
@@ -343,10 +265,24 @@ function validateApiKey() {
   throw new Error('Unexpected response during API key validation: ' + msg);
 }
 
+function validateStockfishUrl() {
+  const url = CONFIG.STOCKFISH_URL;
+  if (!url || url === 'YOUR_CLOUD_FUNCTION_URL' || String(url).trim() === '') {
+    throw new Error('STOCKFISH_URL is not set. Add it in Project Settings → Script Properties.');
+  }
+  // Basic URL format check
+  if (!/^https:\/\/.+/.test(url)) {
+    throw new Error('STOCKFISH_URL must be an HTTPS URL. Got: ' + url);
+  }
+  Logger.log('Stockfish URL configured: ' + url);
+  return true;
+}
+
 function preflight() {
   Logger.log('Account email (sender allowlist): ' + getAccountEmail());
   Logger.log('Destination email: ' + getDestinationEmail());
   validateApiKey();
+  validateStockfishUrl();
   Logger.log('Preflight passed. Ready to play.');
 }
 
@@ -398,42 +334,28 @@ function callClaude(systemPrompt, userMessage) {
   return json.content[0].text;
 }
 
-function getChessSystemPrompt(state) {
+function getCommentaryPrompt(state) {
   const difficultyInstructions = {
-    beginner: 'Play at a beginner level. Make occasional inaccuracies. Prioritise simple, instructive positions. After your move, briefly explain what the move does in plain language.',
-    intermediate: 'Play at a solid club level. Make principled moves but do not play engine-perfect lines. After your move, give a brief positional or tactical comment.',
-    advanced: 'Play at the strongest level you can. After your move, give concise analytical commentary.',
+    beginner: 'The player is a beginner. Explain what the engine\'s move does in plain language. Mention basic concepts like development, controlling the center, or king safety. Keep it encouraging and educational.',
+    intermediate: 'The player is intermediate. Give a brief positional or tactical comment about the engine\'s move. Mention ideas like piece activity, pawn structure, or tactical threats.',
+    advanced: 'The player is advanced. Give concise analytical commentary. Mention strategic plans, key variations, or positional nuances.',
   };
 
-  return `You are a chess engine and tutor. You are playing ${state.playerColour === 'white' ? 'black' : 'white'}.
+  return `You are a chess tutor providing commentary on a game between a human player and a chess engine.
 
-RULES:
-- You receive the current FEN position and move history.
-- Respond with EXACTLY this JSON format, no markdown fencing, no other text:
-{"move":"e4","fen":"<updated FEN after your move>","comment":"<your comment>","gameOver":false,"result":""}
-- Use standard algebraic notation for moves:
-  * Pawn moves: just the destination square (e.g., "e4", "d5")
-  * Piece moves: piece letter + destination (e.g., "Nf3", "Be5")
-  * Captures: include 'x' (e.g., "Nxe5", "exd5")
-  * Castling: "O-O" (kingside) or "O-O-O" (queenside)
-  * Promotion: include '=' (e.g., "e8=Q")
-  * Check/Checkmate: include '+' or '#' (e.g., "Qd7+", "Qf7#")
-- IMPORTANT: Always use capital letters for pieces: K, Q, R, B, N (never lowercase)
-- FEN FORMAT: The en passant square (4th field) must be set correctly:
-  * Set to "-" in most cases (this is the default)
-  * ONLY set to a square (like "e6") when ALL these conditions are met:
-    1. A pawn JUST moved two squares forward on the previous move
-    2. An opponent pawn is on an adjacent file at the correct rank
-    3. That opponent pawn can legally capture en passant
-  * Example: After 1.e4, set to "e3" ONLY if black has a pawn on d4 or f4
-  * Example: After 1...e5, set to "e6" ONLY if white has a pawn on d5 or f5
-  * Common mistake: Setting en passant square when no capture is possible
-- If the game is over (checkmate, stalemate, draw), set gameOver to true and result to the outcome.
-- Validate that your move is legal in the given position.
+You will receive:
+- The current position (FEN) after both moves
+- The player's move and the engine's response
+- The move history
 
-DIFFICULTY: ${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}
+Your job is to comment on the engine's move to help the player learn. Do NOT suggest moves for the player.
 
-Respond ONLY with the JSON object.`;
+Respond with ONLY a JSON object in this exact format, no markdown fencing:
+{"comment":"<your commentary on the engine's move>"}
+
+STYLE: ${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}
+
+Keep your comment concise (1-3 sentences). Respond ONLY with the JSON object.`;
 }
 
 // --- BOARD RENDERING ---
@@ -460,60 +382,137 @@ function generateTextBoard(fen) {
   return board;
 }
 
-// --- CORE GAME LOGIC ---
-function parseClaudeJson(responseText) {
-  const cleaned = String(responseText || '').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-  const parsed = JSON.parse(cleaned);
+// --- STOCKFISH ENGINE ---
+function callStockfish(fen, difficulty) {
+  const url = CONFIG.STOCKFISH_URL;
+  if (!url) throw new Error('STOCKFISH_URL is not set. Add it in Project Settings → Script Properties.');
 
-  if (!parsed || typeof parsed !== 'object') throw new Error('Claude returned non-object JSON.');
+  const payload = {
+    fen: fen,
+    difficulty: difficulty || 'intermediate',
+  };
 
-  const move = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
-  const fen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
-  const comment = safeTrim(parsed.comment, CONFIG.MAX_COMMENT_LEN);
-  const gameOver = Boolean(parsed.gameOver);
-  const result = safeTrim(parsed.result, 200);
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
 
-  if (!move || typeof move !== 'string') throw new Error('Claude returned missing/invalid move.');
-  if (!fen || !isValidFen(fen)) throw new Error('Claude returned invalid FEN.');
+  const response = UrlFetchApp.fetch(url, options);
+  const code = response.getResponseCode();
+  const text = response.getContentText();
 
-  return { move, fen, comment, gameOver, result };
+  if (code < 200 || code >= 300) {
+    throw new Error('Stockfish API error (HTTP ' + code + '): ' + text);
+  }
+
+  const json = JSON.parse(text);
+  if (!json.move) throw new Error('Stockfish returned no move.');
+
+  return json; // { move: "g1f3", evaluation: { type: "cp", value: 30 } }
 }
 
-function getClaudeMove() {
+// --- CORE GAME LOGIC ---
+function getEngineMove() {
   const state = getGameState();
   if (!state.gameActive) return null;
 
-  const systemPrompt = getChessSystemPrompt(state);
-  const userMessage =
-    `Current FEN: ${state.fen}\nMove history: ${state.moveHistory || '(game start)'}\nIt is your turn.`;
+  Logger.log('Requesting engine move for FEN: ' + state.fen);
 
-  const responseText = callClaude(systemPrompt, userMessage);
+  // Call Stockfish Cloud Function
+  const engineResult = callStockfish(state.fen, state.difficulty);
+  const uciMove = engineResult.move; // UCI notation, e.g. "g1f3"
 
-  let parsed;
+  Logger.log('Engine returned UCI move: ' + uciMove);
+
+  // Use chess.js to validate and convert UCI move to SAN
+  const chess = new Chess(state.fen);
+
+  // Convert UCI notation (e.g. "g1f3") to a move object
+  let move;
   try {
-    parsed = parseClaudeJson(responseText);
+    move = chess.move({
+      from: uciMove.substring(0, 2),
+      to: uciMove.substring(2, 4),
+      promotion: uciMove.length > 4 ? uciMove[4] : undefined,
+    });
   } catch (e) {
-    Logger.log('Failed to parse/validate Claude response: ' + String(e && e.message ? e.message : e));
-    throw new Error('Invalid response from Claude (rejected for safety).');
+    Logger.log('Engine move invalid: ' + uciMove + ' — ' + e.toString());
+    throw new Error('Engine returned invalid move: ' + uciMove);
   }
 
-  const claudeColour = state.playerColour === 'white' ? 'black' : 'white';
-  const movePrefix = claudeColour === 'white' ? state.moveNumber + '.' : state.moveNumber + '...';
+  if (!move) {
+    Logger.log('Engine move rejected by chess.js: ' + uciMove);
+    throw new Error('Engine returned illegal move: ' + uciMove);
+  }
 
-  // Validate and correct the en passant square if needed
-  parsed.fen = correctEnPassantSquare(parsed.fen);
+  // Get correct FEN and SAN from chess.js
+  const newFen = chess.fen();
+  const san = move.san;
 
-  state.fen = parsed.fen;
+  Logger.log('Engine move validated: ' + san + ' | New FEN: ' + newFen);
+
+  // Update game state
+  const engineColour = state.playerColour === 'white' ? 'black' : 'white';
+  const movePrefix = engineColour === 'white' ? state.moveNumber + '.' : state.moveNumber + '...';
+
+  state.fen = newFen;
   state.moveHistory = safeTrim(
-    (state.moveHistory ? state.moveHistory + ' ' : '') + movePrefix + parsed.move,
+    (state.moveHistory ? state.moveHistory + ' ' : '') + movePrefix + san,
     CONFIG.MAX_MOVEHIST_LEN
   );
+  if (engineColour === 'black') state.moveNumber++;
 
-  if (claudeColour === 'black') state.moveNumber++;
-  if (parsed.gameOver) state.gameActive = false;
+  // Check for game over conditions using chess.js
+  let gameOver = false;
+  let gameResult = '';
+
+  if (chess.isCheckmate()) {
+    state.gameActive = false;
+    gameOver = true;
+    gameResult = engineColour + ' wins by checkmate';
+  } else if (chess.isDraw()) {
+    state.gameActive = false;
+    gameOver = true;
+    if (chess.isStalemate()) gameResult = 'Draw by stalemate';
+    else if (chess.isThreefoldRepetition()) gameResult = 'Draw by threefold repetition';
+    else gameResult = 'Draw';
+  }
 
   saveGameState(state);
-  return parsed;
+
+  return {
+    move: san,
+    fen: newFen,
+    evaluation: engineResult.evaluation,
+    gameOver: gameOver,
+    result: gameResult,
+  };
+}
+
+function getCommentary(playerMove, engineMove, state) {
+  // Commentary is optional — if it fails, the game continues without it
+  try {
+    const systemPrompt = getCommentaryPrompt(state);
+    const userMessage =
+      `Current FEN: ${state.fen}\n` +
+      `Move history: ${state.moveHistory || '(game start)'}\n` +
+      `Player's move: ${playerMove}\n` +
+      `Engine's response: ${engineMove}`;
+
+    const responseText = callClaude(systemPrompt, userMessage);
+    const cleaned = String(responseText || '').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+
+    return safeTrim(parsed.comment || '', CONFIG.MAX_COMMENT_LEN);
+  } catch (e) {
+    Logger.log('Commentary failed (non-fatal): ' + e.toString());
+    return '';
+  }
 }
 
 function processPlayerMove(moveStr) {
@@ -530,96 +529,62 @@ function processPlayerMove(moveStr) {
   Logger.log('Player colour: ' + state.playerColour);
   Logger.log('Move history: ' + state.moveHistory);
 
-  // Additional validation for common pawn moves
-  if (/^[a-h][1-8]$/.test(moveStr)) {
-    Logger.log('Detected pawn move notation: ' + moveStr);
-  }
-
-  const systemPrompt = `You are a chess validator. The player is ${state.playerColour}.
-
-The player submitted: "${moveStr}"
-
-Analyze the current position carefully and determine if this is a legal move.
-
-IMPORTANT RULES FOR MOVE INTERPRETATION:
-- If the move is just a square like "b3", "e4", "d5" (no piece letter), it's a PAWN move to that square
-- The move "b3" means: move the pawn that can legally reach b3 (usually the b-pawn moving forward)
-- For piece moves, they include the piece letter: "Nf3", "Be5", "Qd4", "Be2", "Bc4"
-  * "Be2" means: move a Bishop to e2 (find which Bishop can legally reach e2)
-  * Check ALL pieces of that type to see if any can make the move
-  * The destination square can be empty or occupied by an opponent's piece
-- Castling is written as "O-O" or "O-O-O"
-
-If this is a legal chess move in the current position:
-- Return: {"valid":true,"fen":"<new FEN after the move>","move":"<standardized algebraic notation>"}
-- CRITICAL FEN RULES for en passant square (4th field):
-  * Default to "-" (this is correct 99% of the time)
-  * ONLY set to a square when the move being made is a pawn moving two squares
-  * AND there's an enemy pawn on an adjacent file that could capture
-  * Example: If white plays b2-b4, set "b3" ONLY if black has a pawn on a4 or c4
-  * Example: If black plays e7-e5, set "e6" ONLY if white has a pawn on d5 or f5
-
-PIECE MOVEMENT RULES TO VALIDATE:
-- Bishop: Moves diagonally any number of squares, path must be clear
-- Knight: Moves in L-shape (2+1 squares), can jump over pieces
-- Rook: Moves horizontally or vertically, path must be clear
-- Queen: Combines Bishop and Rook movement
-- King: Moves one square in any direction (check castling separately)
-
-If illegal:
-- Return: {"valid":false,"reason":"<why it's illegal>"}
-
-CRITICAL VALIDATION NOTES:
-- For moves like "Be2", check if ANY Bishop can reach e2, not just one specific Bishop
-- Double-check that pawn moves like "b3", "e4", "h6" are treated as pawn moves
-- A square being empty doesn't make a move invalid - pieces can move to empty squares!
-Return ONLY the JSON, no other text.`;
-
-  const userMessage =
-    `Current FEN: ${state.fen}\nMove history: ${state.moveHistory || '(game start)'}\nPlayer's move: ${moveStr}`;
-
-  const responseText = callClaude(systemPrompt, userMessage);
-
-  let parsed;
+  // Use chess.js for deterministic move validation
   try {
-    const cleaned = String(responseText || '').replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    parsed = JSON.parse(cleaned);
+    const chess = new Chess(state.fen);
+
+    // Check whose turn it is
+    const fenTurn = state.fen.split(' ')[1]; // 'w' or 'b'
+    const expectedTurn = state.playerColour === 'white' ? 'w' : 'b';
+
+    if (fenTurn !== expectedTurn) {
+      return { error: 'It\'s not your turn. Waiting for Claude\'s move.' };
+    }
+
+    // Try to make the move (chess.js may throw an error for illegal moves)
+    let move;
+    try {
+      move = chess.move(moveStr);
+    } catch (moveError) {
+      // Move is illegal - provide helpful error message
+      const legalMoves = chess.moves();
+      Logger.log('Illegal move attempted: ' + moveStr + '. Legal moves: ' + legalMoves.join(', '));
+
+      // Check if it might be a formatting issue
+      if (/^[a-h][1-8]$/.test(moveStr)) {
+        // Check if there's a pawn move to this square
+        const pawnMoves = legalMoves.filter(m => m === moveStr || m.endsWith(moveStr));
+        if (pawnMoves.length > 0) {
+          return { error: 'Ambiguous pawn move. Please specify: ' + pawnMoves.join(' or ') };
+        }
+      }
+
+      return { error: 'Illegal move. Legal moves include: ' + legalMoves.slice(0, 10).join(', ') + (legalMoves.length > 10 ? '...' : '') };
+    }
+
+    // Move was successful - get the new FEN and standardized notation
+    const nextFen = chess.fen();
+    const stdMove = move.san; // Standard Algebraic Notation from chess.js
+
+    Logger.log('Move validated successfully: ' + stdMove);
+    Logger.log('New FEN: ' + nextFen);
+
+    // Update game state
+    const movePrefix = state.playerColour === 'white' ? state.moveNumber + '.' : state.moveNumber + '...';
+    state.fen = nextFen;
+    state.moveHistory = safeTrim(
+      (state.moveHistory ? state.moveHistory + ' ' : '') + movePrefix + stdMove,
+      CONFIG.MAX_MOVEHIST_LEN
+    );
+    if (state.playerColour === 'black') state.moveNumber++;
+
+    saveGameState(state);
+    return { success: true, move: stdMove, fen: nextFen };
+
   } catch (e) {
-    Logger.log('JSON parse error. Response was: ' + responseText);
-    return { error: 'Failed to process move. Try again.' };
+    Logger.log('Error processing move with chess.js: ' + e.toString());
+    return { error: 'Failed to process move. Please check your notation and try again.' };
   }
-
-  if (!parsed || typeof parsed !== 'object') {
-    Logger.log('Invalid response object: ' + JSON.stringify(parsed));
-    return { error: 'Failed to process move. Try again.' };
-  }
-
-  if (typeof parsed.valid !== 'boolean') {
-    Logger.log('Missing valid field. Response: ' + JSON.stringify(parsed));
-    return { error: 'Failed to process move. Try again.' };
-  }
-
-  if (!parsed.valid) return { error: 'Illegal move: ' + safeTrim(parsed.reason, 200) };
-
-  let nextFen = safeTrim(parsed.fen, CONFIG.MAX_FEN_LEN);
-  const stdMove = safeTrim(parsed.move, CONFIG.MAX_MOVE_LEN);
-
-  // Validate and correct the en passant square if needed
-  nextFen = correctEnPassantSquare(nextFen);
-
-  if (!isValidFen(nextFen)) return { error: 'Move processing returned invalid position. Try again.' };
-  if (!stdMove) return { error: 'Move processing returned invalid move. Try again.' };
-
-  const movePrefix = state.playerColour === 'white' ? state.moveNumber + '.' : state.moveNumber + '...';
-  state.fen = nextFen;
-  state.moveHistory = safeTrim(
-    (state.moveHistory ? state.moveHistory + ' ' : '') + movePrefix + stdMove,
-    CONFIG.MAX_MOVEHIST_LEN
-  );
-  if (state.playerColour === 'black') state.moveNumber++;
-
-  saveGameState(state);
-  return { success: true, move: stdMove, fen: nextFen };
 }
 
 // --- EMAIL ---
@@ -677,15 +642,30 @@ function sendGameEmail(subjectPrefix, body) {
   }
 }
 
-function buildMoveEmail(claudeResponse) {
+function buildMoveEmail(engineResponse, commentary) {
   const state = getGameState();
 
-  let body = `Claude plays: ${claudeResponse.move}\n\n`;
-  body += `${claudeResponse.comment}\n\n`;
+  let body = `Engine plays: ${engineResponse.move}\n\n`;
+
+  // Add evaluation bar if available
+  if (engineResponse.evaluation) {
+    const eval_ = engineResponse.evaluation;
+    if (eval_.type === 'cp') {
+      const pawns = (eval_.value / 100).toFixed(1);
+      body += `Evaluation: ${eval_.value > 0 ? '+' : ''}${pawns} pawns\n\n`;
+    } else if (eval_.type === 'mate') {
+      body += `Evaluation: Mate in ${eval_.value}\n\n`;
+    }
+  }
+
+  if (commentary) {
+    body += `${commentary}\n\n`;
+  }
+
   body += `Move history: ${state.moveHistory}\n\n`;
 
-  if (claudeResponse.gameOver) {
-    body += `Game over: ${claudeResponse.result}\n\n`;
+  if (engineResponse.gameOver) {
+    body += `Game over: ${engineResponse.result}\n\n`;
     body += `Reply NEW to start a new game.\n`;
   } else {
     body += `Reply with your move:\n`;
@@ -721,7 +701,7 @@ function extractMoveFromReply(messageBody) {
   if (!freshText) return null;
 
   // Skip automated emails sent by the script itself
-  if (freshText.startsWith('Claude plays:')) return null;
+  if (freshText.startsWith('Engine plays:')) return null;
   if (freshText.startsWith('Your move:')) return null;
   if (freshText.startsWith('New game!')) return null;
   if (freshText.startsWith('You resigned.')) return null;
@@ -841,12 +821,13 @@ function checkForReplies() {
           return;
         }
 
-        // Add delay between validation and response calls to avoid rate limiting
-        Utilities.sleep(CONFIG.INTER_CALL_DELAY_MS);
+        // Get engine's response move
+        const engineResult = getEngineMove();
+        if (engineResult) {
+          // Get optional commentary from Claude (non-blocking — game proceeds even if this fails)
+          const commentary = getCommentary(result.move, engineResult.move, getGameState());
 
-        const claudeResult = getClaudeMove();
-        if (claudeResult) {
-          const emailBody = 'Your move: ' + result.move + '\n\n' + buildMoveEmail(claudeResult);
+          const emailBody = 'Your move: ' + result.move + '\n\n' + buildMoveEmail(engineResult, commentary);
           sendGameEmail('♟ Chess', emailBody);
 
           // Archive after successful exchange
@@ -885,10 +866,10 @@ function startNewGameInternal_(difficulty, colour) {
   saveGameState(state);
 
   if (col === 'black') {
-    const claudeResult = getClaudeMove();
-    if (claudeResult) {
+    const engineResult = getEngineMove();
+    if (engineResult) {
       let body = `New game! You are black. Difficulty: ${diff}.\n\n`;
-      body += buildMoveEmail(claudeResult);
+      body += buildMoveEmail(engineResult, '');
       body += NOTATION_GUIDE;
       sendGameEmail('♟ New Chess Game', body);
     }
@@ -936,8 +917,8 @@ function quickStart() {
   Logger.log('1/4 Initializing GameState sheet...');
   initialiseSheet();
 
-  // Step 2: Validate API key and email
-  Logger.log('2/4 Validating API key and email...');
+  // Step 2: Validate API key, Stockfish URL, and email
+  Logger.log('2/4 Validating configuration...');
   preflight();
 
   // Step 3: Set up triggers
@@ -949,6 +930,6 @@ function quickStart() {
   startNewGameViaEmail(CONFIG.DIFFICULTY, CONFIG.PLAYER_COLOUR);
 
   Logger.log('✅ Setup complete! Check your inbox for the first chess email.');
-  Logger.log('📧 The thread will be labeled "chess-claude" and auto-archived after moves.');
+  Logger.log('📧 The thread will be labeled "chess-game" and auto-archived after moves.');
   Logger.log('♟️  Reply with your move to play!');
 }
