@@ -351,7 +351,14 @@ RULES:
 - You receive the current FEN position and move history.
 - Respond with EXACTLY this JSON format, no markdown fencing, no other text:
 {"move":"e4","fen":"<updated FEN after your move>","comment":"<your comment>","gameOver":false,"result":""}
-- Use standard algebraic notation for moves (e.g., e4, Nf3, O-O, Qxd7+, e8=Q).
+- Use standard algebraic notation for moves:
+  * Pawn moves: just the destination square (e.g., "e4", "d5")
+  * Piece moves: piece letter + destination (e.g., "Nf3", "Be5")
+  * Captures: include 'x' (e.g., "Nxe5", "exd5")
+  * Castling: "O-O" (kingside) or "O-O-O" (queenside)
+  * Promotion: include '=' (e.g., "e8=Q")
+  * Check/Checkmate: include '+' or '#' (e.g., "Qd7+", "Qf7#")
+- IMPORTANT: Always use capital letters for pieces: K, Q, R, B, N (never lowercase)
 - If the game is over (checkmate, stalemate, draw), set gameOver to true and result to the outcome.
 - Validate that your move is legal in the given position.
 
@@ -454,13 +461,16 @@ function processPlayerMove(moveStr) {
 
 The player submitted: "${moveStr}"
 
+Analyze the current position carefully and determine if this is a legal move.
+
 If this is a legal chess move in the current position:
-- Return: {"valid":true,"fen":"<new FEN after the move>","move":"${moveStr}"}
+- Return: {"valid":true,"fen":"<new FEN after the move>","move":"<standardized algebraic notation>"}
 
 If illegal:
 - Return: {"valid":false,"reason":"<why it's illegal>"}
 
-Remember: "c3" means pawn from c2 to c3. "a3" means pawn from a2 to a3.
+Note: For pawn moves, just the destination square is given (e.g., "e4" means move a pawn to e4).
+The pawn that moves is the one that can legally reach that square.
 Return ONLY the JSON, no other text.`;
 
   const userMessage =
