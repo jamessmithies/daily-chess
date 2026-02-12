@@ -80,6 +80,7 @@ From the `stockfish-cloud-function/` directory:
 cd stockfish-cloud-function
 
 gcloud functions deploy getMove \
+  --project=YOUR_PROJECT_ID \
   --gen2 \
   --runtime=nodejs20 \
   --region=us-central1 \
@@ -332,6 +333,14 @@ A: One active game at a time per script instance.
 **Q: How much does it cost?**
 A: Under $1/month for casual play. See [Estimated Costs](#estimated-costs).
 
+## Acknowledgements
+
+- **[Stockfish](https://stockfishchess.org/)** - Chess engine, licensed under [GPLv3](https://www.gnu.org/licenses/gpl-3.0.html). Used as a runtime dependency via the [stockfish](https://www.npmjs.com/package/stockfish) npm package. Stockfish is not distributed with this project; it is installed as a dependency of the Cloud Function.
+- **[chess.js](https://github.com/jhlywa/chess.js)** by Jeff Hlywa - Chess rules library, licensed under [BSD-2-Clause](https://opensource.org/licenses/BSD-2-Clause). Adapted and embedded in `Chess.gs` for Google Apps Script compatibility.
+- **[Claude](https://www.anthropic.com/)** by Anthropic - AI model used for teaching commentary.
+
 ## License
 
-MIT License - See LICENSE file for details
+MIT License - See LICENSE file for details.
+
+This license applies to the project's own code (`code.gs`, Cloud Function wrapper, etc.). Third-party dependencies retain their original licenses: Stockfish is GPLv3, chess.js is BSD-2-Clause. See `Chess.gs` header for the full chess.js license text.

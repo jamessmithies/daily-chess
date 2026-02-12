@@ -1,6 +1,29 @@
-// Chess.js library for Google Apps Script
-// Adapted from chess.js v1.0.0 (https://github.com/jhlywa/chess.js)
-// License: BSD-2-Clause
+// chess.js v1.4.0 - adapted for Google Apps Script
+// https://github.com/jhlywa/chess.js
+//
+// Copyright (c) 2025, Jeff Hlywa (jhlywa@gmail.com)
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice,
+//    this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
 
 var ChessLib = (function() {
   'use strict';
@@ -1302,23 +1325,6 @@ const QUEEN = 'q';
 const KING = 'k';
 const DEFAULT_POSITION = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 class Move {
-    color;
-    from;
-    to;
-    piece;
-    captured;
-    promotion;
-    /**
-     * @deprecated This field is deprecated and will be removed in version 2.0.0.
-     * Please use move descriptor functions instead: `isCapture`, `isPromotion`,
-     * `isEnPassant`, `isKingsideCastle`, `isQueensideCastle`, `isCastle`, and
-     * `isBigPawn`
-     */
-    flags;
-    san;
-    lan;
-    before;
-    after;
     constructor(chess, internal) {
         const { color, piece, from, to, flags, captured, promotion } = internal;
         const fromAlgebraic = algebraic(from);
@@ -1805,20 +1811,19 @@ function strippedSan(move) {
     return move.replace(/=/, '').replace(/[+#]?[?!]*$/, '');
 }
 class Chess {
-    _board = new Array(128);
-    _turn = WHITE;
-    _header = {};
-    _kings = { w: EMPTY, b: EMPTY };
-    _epSquare = -1;
-    _halfMoves = 0;
-    _moveNumber = 0;
-    _history = [];
-    _comments = {};
-    _castling = { w: 0, b: 0 };
-    _hash = BigInt(0);
-    // tracks number of times a position has been seen for repetition checking
-    _positionCount = new Map();
     constructor(fen = DEFAULT_POSITION, { skipValidation = false } = {}) {
+        this._board = new Array(128);
+        this._turn = WHITE;
+        this._header = {};
+        this._kings = { w: EMPTY, b: EMPTY };
+        this._epSquare = -1;
+        this._halfMoves = 0;
+        this._moveNumber = 0;
+        this._history = [];
+        this._comments = {};
+        this._castling = { w: 0, b: 0 };
+        this._hash = BigInt(0);
+        this._positionCount = new Map();
         this.load(fen, { skipValidation });
     }
     clear({ preserveHeaders = false } = {}) {
