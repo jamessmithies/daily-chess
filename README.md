@@ -97,20 +97,39 @@ Note the **URL** from the output. It will look like:
 https://us-central1-email-chess.cloudfunctions.net/getMove
 ```
 
-### Step 4: Grant invoke permission
+### Step 4: Create a service account for the Cloud Function
 
-Google Apps Script runs under your Google account's identity. Grant it permission to call the Cloud Function:
+Gen2 Cloud Functions run on Cloud Run, which requires an **ID token** (not an access token) for authentication. Apps Script obtains this by impersonating a service account.
 
 ```bash
+# Create a service account
+gcloud iam service-accounts create stockfish-invoker \
+  --display-name="Stockfish Cloud Function Invoker"
+
+# Grant it permission to invoke the Cloud Function
 gcloud functions add-invoker-policy-binding getMove \
   --gen2 \
   --region=us-central1 \
-  --member="user:YOUR_EMAIL@gmail.com"
+  --member="serviceAccount:stockfish-invoker@YOUR_PROJECT_ID.iam.gserviceaccount.com"
+
+# Grant your Google account permission to impersonate this service account
+gcloud iam service-accounts add-iam-policy-binding \
+  stockfish-invoker@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+  --member="user:YOUR_EMAIL@gmail.com" \
+  --role="roles/iam.serviceAccountTokenCreator"
 ```
 
-Replace `YOUR_EMAIL@gmail.com` with the Google account that owns the Apps Script project.
+Replace `YOUR_PROJECT_ID` and `YOUR_EMAIL@gmail.com` with your values.
 
-### Step 5: Test the Cloud Function
+Note the service account email: `stockfish-invoker@YOUR_PROJECT_ID.iam.gserviceaccount.com`
+
+### Step 5: Enable the IAM Credentials API
+
+```bash
+gcloud services enable iamcredentials.googleapis.com
+```
+
+### Step 6: Test the Cloud Function
 
 ```bash
 TOKEN=$(gcloud auth print-identity-token)
@@ -119,7 +138,7 @@ curl -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "difficulty": "intermediate"}' \
-  https://us-central1-email-chess.cloudfunctions.net/getMove
+  YOUR_CLOUD_FUNCTION_URL
 ```
 
 Expected response:
@@ -127,13 +146,22 @@ Expected response:
 {"move":"e2e4","evaluation":{"type":"cp","value":30}}
 ```
 
-### Step 6: Create the Apps Script project
+### Step 7: Create the Apps Script project
 
 1. Open [Google Sheets](https://sheets.google.com) and create a new blank spreadsheet
 2. Go to **Extensions > Apps Script**
 3. Delete any default code in the editor
 
-### Step 7: Add the script files
+### Step 8: Link Apps Script to your GCP project
+
+Apps Script needs to use your GCP project (not its default hidden project) so it can call the IAM Credentials API.
+
+1. In the Apps Script editor, click **Project Settings** (gear icon)
+2. Under **Google Cloud Platform (GCP) Project**, click **Change project**
+3. Enter your GCP project **number** (find it at [console.cloud.google.com](https://console.cloud.google.com) under project settings -- it's the numeric ID, not the project name)
+4. Click **Set project**
+
+### Step 9: Add the script files
 
 **File 1: Chess.gs**
 1. Click the **+** next to "Files" in the left sidebar
@@ -147,7 +175,7 @@ Expected response:
 2. Replace all content with the contents of `code.gs` from this repo
 3. Save (Ctrl+S)
 
-### Step 8: Configure Script Properties
+### Step 10: Configure Script Properties
 
 1. Click **Project Settings** (gear icon in left sidebar)
 2. Scroll to **Script Properties**
@@ -157,13 +185,14 @@ Expected response:
 |----------|-------|
 | `ANTHROPIC_API_KEY` | Your Anthropic API key |
 | `STOCKFISH_URL` | The Cloud Function URL from step 3 |
+| `STOCKFISH_SA` | The service account email from step 4 (e.g. `stockfish-invoker@your-project.iam.gserviceaccount.com`) |
 | `EMAIL` | *(Optional)* Your email address. If not set, uses the account email. |
 
-### Step 9: Start playing
+### Step 11: Start playing
 
 1. In the Apps Script editor, select `quickStart` from the function dropdown
 2. Click **Run**
-3. When prompted, click **Review Permissions** and authorize the script
+3. When prompted, click **Review Permissions** and authorize the script (you may need to click "Advanced" and "Go to project" if it shows a warning)
 4. Check your inbox for the first chess email
 
 ## How to Play
@@ -248,9 +277,17 @@ Edit these in the `CONFIG` object at the top of `code.gs`:
 - Ensure the property name is exactly `STOCKFISH_URL`
 
 ### Cloud Function returns 403/401
-- Verify you ran the `add-invoker-policy-binding` command (step 4)
-- Ensure the email in the command matches the Google account running the Apps Script
+- Verify the service account has Cloud Run Invoker role (step 4)
+- Verify your Google account has Service Account Token Creator role on the SA (step 4)
+- Verify the IAM Credentials API is enabled (step 5)
+- Verify the Apps Script project is linked to your GCP project (step 8)
+- Check that `STOCKFISH_SA` is set correctly in Script Properties
 - IAM changes can take a few minutes to propagate
+
+### "Failed to get ID token" error
+- Ensure `STOCKFISH_SA` in Script Properties is a valid service account email
+- Verify your Apps Script project is linked to the correct GCP project (step 8)
+- Verify your Google account has the `roles/iam.serviceAccountTokenCreator` role
 
 ### "Engine returned invalid move" error
 - This should be rare. Check that the FEN in the GameState sheet is valid

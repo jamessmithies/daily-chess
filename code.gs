@@ -275,6 +275,16 @@ function validateStockfishUrl() {
     throw new Error('STOCKFISH_URL must be an HTTPS URL. Got: ' + url);
   }
   Logger.log('Stockfish URL configured: ' + url);
+
+  const sa = PropertiesService.getScriptProperties().getProperty('STOCKFISH_SA');
+  if (!sa || String(sa).trim() === '') {
+    throw new Error('STOCKFISH_SA is not set. Add the service account email in Script Properties.');
+  }
+  if (!sa.includes('@') || !sa.includes('.iam.gserviceaccount.com')) {
+    throw new Error('STOCKFISH_SA does not look like a service account email. Expected format: name@project.iam.gserviceaccount.com');
+  }
+  Logger.log('Stockfish service account configured: ' + sa);
+
   return true;
 }
 
@@ -383,9 +393,53 @@ function generateTextBoard(fen) {
 }
 
 // --- STOCKFISH ENGINE ---
+
+/**
+ * Fetches an ID token for the Cloud Function via the IAM Credentials API.
+ * Gen2 Cloud Functions (Cloud Run) require an ID token, not an access token.
+ *
+ * Requires:
+ *   - STOCKFISH_SA script property (service account email with Cloud Run Invoker role)
+ *   - The Apps Script user must have Service Account Token Creator role on that SA
+ *   - The Apps Script project must be linked to the same GCP project
+ */
+function getIdToken(audience) {
+  const sa = PropertiesService.getScriptProperties().getProperty('STOCKFISH_SA');
+  if (!sa) throw new Error('STOCKFISH_SA is not set. Add the service account email in Script Properties.');
+
+  const tokenUrl = 'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/' +
+    sa + ':generateIdToken';
+
+  const tokenOptions = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+    },
+    payload: JSON.stringify({
+      audience: audience,
+      includeEmail: true,
+    }),
+    muteHttpExceptions: true,
+  };
+
+  const resp = UrlFetchApp.fetch(tokenUrl, tokenOptions);
+  const code = resp.getResponseCode();
+
+  if (code < 200 || code >= 300) {
+    throw new Error('Failed to get ID token (HTTP ' + code + '): ' + resp.getContentText());
+  }
+
+  const json = JSON.parse(resp.getContentText());
+  return json.token;
+}
+
 function callStockfish(fen, difficulty) {
   const url = CONFIG.STOCKFISH_URL;
   if (!url) throw new Error('STOCKFISH_URL is not set. Add it in Project Settings → Script Properties.');
+
+  // Get an ID token scoped to the Cloud Function URL
+  const idToken = getIdToken(url);
 
   const payload = {
     fen: fen,
@@ -396,7 +450,7 @@ function callStockfish(fen, difficulty) {
     method: 'post',
     contentType: 'application/json',
     headers: {
-      'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+      'Authorization': 'Bearer ' + idToken,
     },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true,
