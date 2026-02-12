@@ -19,15 +19,6 @@ Play correspondence chess against Stockfish through email, with Claude providing
 - **Position Evaluation**: See how the engine assesses each position
 - **Deterministic Validation**: chess.js validates all moves - no hallucinated illegal moves
 
-## How it works
-
-1. Set up the Google spreadsheet, Apps Script project, and Cloud Function
-2. You receive an email with Stockfish's move and Claude's commentary
-3. You reply with your move in algebraic notation
-4. The script polls Gmail, validates your move with chess.js, gets Stockfish's response from the Cloud Function, and emails it back with Claude's analysis
-5. Game state lives in a Google Sheet that can be shared with any AI chatbot for further analysis
-6. All chess emails are labeled "chess-game" for easy filtering
-
 ## Architecture
 
 ```
@@ -39,32 +30,145 @@ Player email reply
   -> Sends reply email with move + evaluation + commentary
 ```
 
-## Quick Start
+Three components:
 
-See [DEPLOYMENT_INSTRUCTIONS.md](DEPLOYMENT_INSTRUCTIONS.md) for the full setup guide, including:
-- Deploying the Stockfish Cloud Function with IAM authentication
-- Configuring Google Apps Script
-- Setting billing budget alerts
+1. **Google Apps Script (code.gs + Chess.gs)** - Email flow, game state, move validation (chess.js), Claude commentary
+2. **Google Cloud Function (Stockfish WASM)** - Stockfish 16 chess engine for opponent moves
+3. **Claude API** - Teaching commentary (non-blocking; game works even if commentary fails)
 
-### Prerequisites
+## Prerequisites
 
 - Google account with Gmail and Google Sheets
 - Anthropic API key ([get one here](https://console.anthropic.com))
 - Google Cloud project with billing enabled
-- `gcloud` CLI installed
+- `gcloud` CLI installed ([install guide](https://cloud.google.com/sdk/docs/install))
 
-### Short version
+## Setup
 
-1. Deploy the Cloud Function: `gcloud functions deploy getMove --gen2 ...`
-2. Grant invoke permission to your Google account
-3. Create a Google Sheet, open Extensions > Apps Script
-4. Add `Chess.gs` and `code.gs`
-5. Set Script Properties: `ANTHROPIC_API_KEY`, `STOCKFISH_URL`
-6. Run `quickStart()`
+### Step 1: Set up Google Cloud project
+
+```bash
+# Authenticate
+gcloud auth login
+
+# Create a new project (or use an existing one)
+gcloud projects create email-chess --name="Email Chess"
+gcloud config set project email-chess
+
+# Enable required APIs
+gcloud services enable cloudfunctions.googleapis.com
+gcloud services enable cloudbuild.googleapis.com
+gcloud services enable run.googleapis.com
+```
+
+### Step 2: Set a billing budget alert
+
+Expected cost is well under $1/month for personal use, but set a ceiling to be safe.
+
+1. Go to the [billing console](https://console.cloud.google.com/billing)
+2. Navigate to **Billing** > **Budgets & alerts**
+3. Click **Create budget**
+4. Set the budget amount to **$5**
+5. Set alert thresholds at **50%**, **90%**, and **100%**
+6. Enable email notifications
+
+### Step 3: Deploy the Stockfish Cloud Function
+
+From the `stockfish-cloud-function/` directory:
+
+```bash
+cd stockfish-cloud-function
+
+gcloud functions deploy getMove \
+  --gen2 \
+  --runtime=nodejs20 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=getMove \
+  --trigger-http \
+  --no-allow-unauthenticated \
+  --memory=512MB \
+  --timeout=120s
+```
+
+Note the **URL** from the output. It will look like:
+```
+https://us-central1-email-chess.cloudfunctions.net/getMove
+```
+
+### Step 4: Grant invoke permission
+
+Google Apps Script runs under your Google account's identity. Grant it permission to call the Cloud Function:
+
+```bash
+gcloud functions add-invoker-policy-binding getMove \
+  --gen2 \
+  --region=us-central1 \
+  --member="user:YOUR_EMAIL@gmail.com"
+```
+
+Replace `YOUR_EMAIL@gmail.com` with the Google account that owns the Apps Script project.
+
+### Step 5: Test the Cloud Function
+
+```bash
+TOKEN=$(gcloud auth print-identity-token)
+
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "difficulty": "intermediate"}' \
+  https://us-central1-email-chess.cloudfunctions.net/getMove
+```
+
+Expected response:
+```json
+{"move":"e2e4","evaluation":{"type":"cp","value":30}}
+```
+
+### Step 6: Create the Apps Script project
+
+1. Open [Google Sheets](https://sheets.google.com) and create a new blank spreadsheet
+2. Go to **Extensions > Apps Script**
+3. Delete any default code in the editor
+
+### Step 7: Add the script files
+
+**File 1: Chess.gs**
+1. Click the **+** next to "Files" in the left sidebar
+2. Select **Script** and name it `Chess`
+3. Delete any default content
+4. Copy the entire contents of `Chess.gs` from this repo and paste it in
+5. Save (Ctrl+S)
+
+**File 2: Code.gs**
+1. Click on the default `Code.gs` file
+2. Replace all content with the contents of `code.gs` from this repo
+3. Save (Ctrl+S)
+
+### Step 8: Configure Script Properties
+
+1. Click **Project Settings** (gear icon in left sidebar)
+2. Scroll to **Script Properties**
+3. Add these properties:
+
+| Property | Value |
+|----------|-------|
+| `ANTHROPIC_API_KEY` | Your Anthropic API key |
+| `STOCKFISH_URL` | The Cloud Function URL from step 3 |
+| `EMAIL` | *(Optional)* Your email address. If not set, uses the account email. |
+
+### Step 9: Start playing
+
+1. In the Apps Script editor, select `quickStart` from the function dropdown
+2. Click **Run**
+3. When prompted, click **Review Permissions** and authorize the script
+4. Check your inbox for the first chess email
 
 ## How to Play
 
 ### Making Moves
+
 Reply to the email thread with your move as the **first word**:
 - `e4` - Pawn to e4
 - `Nf3` - Knight to f3
@@ -72,6 +176,7 @@ Reply to the email thread with your move as the **first word**:
 - `Qxd7+` - Queen takes d7, check
 
 ### Commands
+
 Type these as the **first word** in your reply:
 - `NEW` - Start a new game
 - `RESIGN` - Resign current game
@@ -79,6 +184,7 @@ Type these as the **first word** in your reply:
 - `CONTINUE` - Resume after pause
 
 ### Algebraic Notation Quick Reference
+
 ```
 Pieces:  K=King Q=Queen R=Rook B=Bishop N=Knight (pawns have no letter)
 Moves:   Nf3 = knight to f3
@@ -89,15 +195,24 @@ Check:   + (e.g. Qd7+)
 Mate:    # (e.g. Qf7#)
 ```
 
-## Configuration Options
+### What the Emails Look Like
 
-Edit these in the script's `CONFIG` object:
+Each response email contains:
+- The engine's move in standard algebraic notation
+- Position evaluation (how the engine assesses the position)
+- Full move history
+- Current FEN position
+- Claude's teaching commentary (strategic explanations, tips)
+
+## Configuration
+
+Edit these in the `CONFIG` object at the top of `code.gs`:
 
 | Setting | Default | Options | Description |
 |---------|---------|---------|-------------|
 | `DIFFICULTY` | `intermediate` | `beginner`, `intermediate`, `advanced` | Stockfish playing strength |
 | `PLAYER_COLOUR` | `white` | `white`, `black` | Your color for new games |
-| `POLL_MINUTES` | `5` | Any number | How often to check for replies |
+| `POLL_MINUTES` | `5` | Any number | How often to check for replies (minutes) |
 
 ### Difficulty Levels
 
@@ -107,49 +222,95 @@ Edit these in the script's `CONFIG` object:
 | Intermediate | 10 | 10 | ~1800 |
 | Advanced | 20 | 15 | ~2500+ |
 
+## Security
+
+- The Cloud Function is deployed with **IAM authentication** -- it is not publicly accessible
+- GAS authenticates using `ScriptApp.getOAuthToken()` which provides an OAuth 2.0 token
+- Only your Google account (and any accounts you explicitly grant `roles/run.invoker`) can call the function
+- The only data sent to the Cloud Function is FEN strings (board positions) -- no personal data
+- The Anthropic API key is stored in GAS Script Properties (encrypted at rest by Google)
+
 ## Estimated Costs
 
 | Component | Monthly Cost |
 |-----------|-------------|
-| Cloud Function (Stockfish) | < $0.10 |
-| Claude API (commentary) | ~$0.10-0.30/game |
+| Cloud Function (Stockfish) | < $0.10 (2M free invocations/month) |
+| Claude API (commentary) | ~$0.10-0.30 per full game |
 | Google Apps Script / Gmail / Sheets | Free |
 
 **Total**: Under $1/month for casual play.
 
 ## Troubleshooting
 
-### Game Not Responding?
-- Check that triggers are set up (run `setupTriggers()`)
-- Verify your move is the first word in your reply
-- Ensure you're replying to the correct thread
+### "STOCKFISH_URL is not set" error
+- Check Script Properties in the Apps Script project settings
+- Ensure the property name is exactly `STOCKFISH_URL`
 
-### Cloud Function Errors?
-- Verify IAM permissions (see deployment guide step 1.4)
-- Test the function with `curl` (see deployment guide step 1.5)
-- Check Cloud Function logs in the Google Cloud Console
+### Cloud Function returns 403/401
+- Verify you ran the `add-invoker-policy-binding` command (step 4)
+- Ensure the email in the command matches the Google account running the Apps Script
+- IAM changes can take a few minutes to propagate
 
-### API Errors?
-- Verify your Anthropic API key in Script Properties
-- Commentary is non-fatal - games continue without it
+### "Engine returned invalid move" error
+- This should be rare. Check that the FEN in the GameState sheet is valid
+- Try starting a new game with the `NEW` command
 
-### Email Issues?
-- Check spam/promotions folders
-- Look for threads labeled "chess-game"
-- Ensure you're using the account that owns the script
+### Commentary missing from emails
+- Commentary is non-fatal -- if the Claude API fails, the game continues without it
+- Check your Anthropic API key is valid and has credit
+- Check the Apps Script execution log for details
 
-### Reset Everything?
-Run these in order:
-1. Delete all triggers: `ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t))`
+### Moves not being picked up
+- Verify triggers are set up: run `setupTriggers()` in the Apps Script editor
+- Check that your reply is in the correct email thread
+- Your move must be the first word in the reply
+
+### Reset everything
+1. Delete all triggers in the Apps Script console:
+   ```javascript
+   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t))
+   ```
 2. Run `quickStart()` again
 
-## Tips
+## Updating the Cloud Function
 
-- Emails stay in your Gmail - delete or archive them as you prefer
-- Moves are processed within 5 minutes by default
-- Claude provides strategic commentary calibrated to the difficulty level
-- You can have one active game at a time
-- Share your GameState sheet link with any LLM chatbot for additional analysis
+If you need to redeploy after changes:
+
+```bash
+cd stockfish-cloud-function
+
+gcloud functions deploy getMove \
+  --gen2 \
+  --runtime=nodejs20 \
+  --region=us-central1 \
+  --source=. \
+  --entry-point=getMove \
+  --trigger-http \
+  --no-allow-unauthenticated \
+  --memory=512MB \
+  --timeout=120s
+```
+
+## Local Testing
+
+### Test Stockfish directly
+
+```bash
+cd stockfish-cloud-function
+npm install
+node test.js
+```
+
+### Test the Cloud Function HTTP server locally
+
+```bash
+cd stockfish-cloud-function
+npm start
+# In another terminal:
+curl -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -d '{"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "difficulty": "beginner"}'
+```
 
 ## FAQ
 
@@ -167,6 +328,9 @@ A: chess.js validates your move deterministically and shows you the list of lega
 
 **Q: Can I play multiple games?**
 A: One active game at a time per script instance.
+
+**Q: How much does it cost?**
+A: Under $1/month for casual play. See [Estimated Costs](#estimated-costs).
 
 ## License
 
