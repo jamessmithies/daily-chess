@@ -14,6 +14,7 @@
 //   /resign         — resign the current game
 //   /status         — show current board and game state
 //   /difficulty <level> — set difficulty (beginner/intermediate/advanced)
+//   /notation       — move notation guide
 //   /help           — show help
 //   Any message     — interpreted as a chess move (e.g. e4, Nf3, O-O)
 // ============================================================
@@ -455,9 +456,44 @@ async function handleHelp(chatId) {
     '  /resign \u2014 resign current game',
     '  /status \u2014 show board',
     '  /difficulty <level> \u2014 set difficulty',
+    '  /notation \u2014 move notation guide',
     '  /help \u2014 this message\n',
     'To move, just send algebraic notation:',
     '  e4, Nf3, Bxe5, O-O, e8=Q',
+  ].join('\n'));
+}
+
+async function handleNotation(chatId) {
+  await sendMessage(chatId, [
+    'Move Notation Guide\n',
+    'This bot uses Standard Algebraic Notation (SAN).\n',
+    'Pieces:',
+    '  K = King, Q = Queen, R = Rook',
+    '  B = Bishop, N = Knight',
+    '  Pawns have no letter prefix.\n',
+    'Basic moves:',
+    '  e4      \u2014 pawn to e4',
+    '  Nf3     \u2014 knight to f3',
+    '  Bb5     \u2014 bishop to b5\n',
+    'Captures (use x):',
+    '  Bxe5    \u2014 bishop captures on e5',
+    '  Nxd4    \u2014 knight captures on d4',
+    '  exd5    \u2014 pawn on e-file captures on d5',
+    '  Note: for pawn captures, use the file',
+    '  the pawn is on, not "P". Pxe5 is wrong,',
+    '  dxe5 or exd5 is correct.\n',
+    'Castling:',
+    '  O-O     \u2014 kingside castling',
+    '  O-O-O   \u2014 queenside castling',
+    '  (0-0 and o-o also accepted)\n',
+    'Pawn promotion:',
+    '  e8=Q    \u2014 pawn promotes to queen',
+    '  exf1=N  \u2014 pawn captures and promotes to knight\n',
+    'Check / checkmate:',
+    '  Qd7+    \u2014 queen to d7 with check',
+    '  Qf7#    \u2014 queen to f7, checkmate',
+    '  (+ and # are optional, the bot accepts',
+    '  moves with or without them)',
   ].join('\n'));
 }
 
@@ -530,6 +566,9 @@ functions.http('telegramWebhook', async (req, res) => {
           break;
         case '/help':
           await handleHelp(chatId);
+          break;
+        case '/notation':
+          await handleNotation(chatId);
           break;
         default:
           await sendMessage(chatId, `Unknown command: ${cmd}\nSend /help for available commands.`);
