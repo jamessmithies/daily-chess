@@ -1,0 +1,19 @@
+{
+  "name": "telegram-chess-bot",
+  "version": "1.0.0",
+  "description": "Telegram chess bot — play against Stockfish with Claude commentary",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "npx @google-cloud/functions-framework --target=telegramWebhook",
+    "set-webhook": "node set-webhook.js"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.0.0",
+    "@google-cloud/storage": "^7.0.0",
+    "chess.js": "0.13.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

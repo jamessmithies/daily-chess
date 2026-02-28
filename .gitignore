@@ -1,9 +1,8 @@
 # Dependencies
 node_modules/
 
-# Google Apps Script local files
-.clasp.json
-.claspignore
+# Environment / secrets
+.env
 
 # Claude Code settings
 .claude/

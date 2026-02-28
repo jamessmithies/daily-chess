@@ -1,7 +1,7 @@
 {
   "name": "stockfish-cloud-function",
   "version": "1.0.0",
-  "description": "Google Cloud Function wrapping Stockfish WASM for email-chess",
+  "description": "Google Cloud Function wrapping Stockfish WASM for Telegram chess bot",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
