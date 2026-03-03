@@ -90,11 +90,16 @@ async function loadState(chatId) {
   try {
     const file = storage.bucket(CONFIG.GCS_BUCKET).file(getStateFilePath(chatId));
     const [exists] = await file.exists();
-    if (!exists) return defaultState();
+    if (!exists) {
+      console.log(`[loadState] chatId=${chatId} no saved state, returning default`);
+      return defaultState();
+    }
     const [content] = await file.download();
-    return JSON.parse(content.toString());
+    const state = JSON.parse(content.toString());
+    console.log(`[loadState] chatId=${chatId} fen="${state.fen}" moveNumber=${state.moveNumber} active=${state.gameActive}`);
+    return state;
   } catch (e) {
-    console.error('Failed to load state:', e.message);
+    console.error(`[loadState] chatId=${chatId} FAILED error="${e.message}" — returning default state`);
     return defaultState();
   }
 }
@@ -281,6 +286,8 @@ function parseMove(text) {
 }
 
 async function processMove(chatId, moveStr, state) {
+  console.log(`[processMove] chatId=${chatId} move="${moveStr}" fen="${state.fen}" moveNumber=${state.moveNumber} history="${state.moveHistory}"`);
+
   if (!state.gameActive) {
     await sendMessage(chatId, 'No active game. Send /new to start one.');
     return;
@@ -298,12 +305,26 @@ async function processMove(chatId, moveStr, state) {
   const move = chess.move(moveStr);
   if (!move) {
     const legal = chess.moves();
-    await sendMessage(chatId,
-      `Illegal move: ${moveStr}\n\nLegal moves: ${legal.slice(0, 15).join(', ')}${legal.length > 15 ? '...' : ''}`);
+    // Check if the move was ambiguous (e.g. Nf3 when two knights can reach f3)
+    const piece = /^[KQRBN]/.test(moveStr) ? moveStr[0] : '';
+    const target = moveStr.replace(/^[KQRBN]/, '').replace(/[x+#]|=[QRBN]/g, '');
+    const disambiguated = piece
+      ? legal.filter(m => m.startsWith(piece) && m.includes(target) && m !== moveStr)
+      : [];
+    let errorMsg;
+    if (disambiguated.length > 1) {
+      console.log(`[processMove] AMBIGUOUS move="${moveStr}" candidates=[${disambiguated.join(', ')}] fen="${state.fen}" legalMoves=[${legal.join(', ')}]`);
+      errorMsg = `Ambiguous move: ${moveStr}\n\nMultiple pieces can reach that square. Did you mean: ${disambiguated.join(' or ')}?\n\nType /notation for help with chess notation.`;
+    } else {
+      console.log(`[processMove] ILLEGAL move="${moveStr}" fen="${state.fen}" legalMoves=[${legal.join(', ')}]`);
+      errorMsg = `Illegal move: ${moveStr}\n\nLegal moves: ${legal.slice(0, 15).join(', ')}${legal.length > 15 ? '...' : ''}\n\nType /notation for help with chess notation.`;
+    }
+    await sendMessage(chatId, errorMsg);
     return;
   }
 
   // Player move accepted — snapshot state first for rollback, then update
+  console.log(`[processMove] ACCEPTED move="${moveStr}" san="${move.san}" newFen="${chess.fen()}"`);
   const playerSan = move.san;
   const prevFen = state.fen;
   const prevHistory = state.moveHistory;
@@ -334,7 +355,7 @@ async function processMove(chatId, moveStr, state) {
   try {
     engineResult = await callStockfish(state.fen, state.difficulty);
   } catch (e) {
-    console.error('Stockfish error:', e.message);
+    console.error(`[processMove] STOCKFISH_ERROR move="${moveStr}" fen="${state.fen}" error="${e.message}"`);
     // Roll back so player can resend their move
     state.fen = prevFen;
     state.moveHistory = prevHistory;
@@ -353,7 +374,13 @@ async function processMove(chatId, moveStr, state) {
     promotion: uci.length > 4 ? uci[4] : undefined,
   });
   if (!engineMove) {
-    await sendMessage(chatId, `Engine returned invalid move: ${uci}. Game state may be corrupted. Send /new to start over.`);
+    console.error(`[processMove] ENGINE_INVALID_MOVE uci="${uci}" fen="${state.fen}" legalMoves=[${engineChess.moves().join(', ')}]`);
+    // Player's move was already saved at this point, so state is safe — just roll back
+    state.fen = prevFen;
+    state.moveHistory = prevHistory;
+    state.moveNumber = prevMoveNumber;
+    await saveState(chatId, state);
+    await sendMessage(chatId, `Engine returned invalid move: ${uci}. Your move has been rolled back — please send your move again.`);
     return;
   }
 
