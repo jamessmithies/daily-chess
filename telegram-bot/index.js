@@ -581,6 +581,17 @@ functions.http('telegramWebhook', async (req, res) => {
   try {
     const state = await loadState(chatId);
 
+    // Deduplicate Telegram webhook retries (retries carry the same update_id).
+    // Without this, a retry arriving after the game state has advanced causes
+    // the user's own move to appear illegal on the updated board.
+    const updateId = update.update_id;
+    if (state.lastUpdateId !== undefined && updateId <= state.lastUpdateId) {
+      console.log(`[webhook] chatId=${chatId} skipping duplicate updateId=${updateId} (lastSeen=${state.lastUpdateId})`);
+      res.status(200).send('OK');
+      return;
+    }
+    state.lastUpdateId = updateId;
+
     // Parse commands
     if (text.startsWith('/')) {
       const parts = text.split(/\s+/);
